@@ -75,12 +75,10 @@ fn planar_2bit_4channel_rows_per_strip_1_roundtrips_exactly() {
     let handle = writer.add_image(image).unwrap();
 
     let blocks_per_plane = height as usize; // RowsPerStrip=1
-    for band in 0..samples_per_pixel as usize {
-        for row in 0..height as usize {
+    for (band, rows) in band_rows.iter().enumerate() {
+        for (row, values) in rows.iter().enumerate() {
             let block_index = band * blocks_per_plane + row;
-            writer
-                .write_block(&handle, block_index, &band_rows[band][row])
-                .unwrap();
+            writer.write_block(&handle, block_index, values).unwrap();
         }
     }
     writer.finish().unwrap();
@@ -94,11 +92,11 @@ fn planar_2bit_4channel_rows_per_strip_1_roundtrips_exactly() {
     );
     assert_eq!(ifd.rows_per_strip(), 1);
 
-    for band in 0..samples_per_pixel as usize {
+    for (band, rows) in band_rows.iter().enumerate() {
         let decoded = file.read_band::<u8>(0, band).unwrap();
         let (decoded_values, offset) = decoded.into_raw_vec_and_offset();
         assert_eq!(offset, Some(0));
-        let expected: Vec<u8> = band_rows[band].iter().flatten().copied().collect();
+        let expected: Vec<u8> = rows.iter().flatten().copied().collect();
         assert_eq!(decoded_values, expected, "band {band} mismatch");
     }
 }
