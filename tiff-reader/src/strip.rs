@@ -7,6 +7,8 @@ use parking_lot::Mutex;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
+use tiff_core::Compression;
+
 use crate::block_decode;
 use crate::cache::{BlockCache, BlockKey, BlockKind};
 use crate::error::{Error, Result};
@@ -15,7 +17,8 @@ use crate::ifd::{Ifd, RasterLayout};
 use crate::source::TiffSource;
 use crate::{
     allocate_decode_output, checked_layout_add, checked_layout_mul, read_block_payload,
-    read_gdal_block_payload, validate_decode_output_len, DecodeReadOptions, Window,
+    read_gdal_block_payload, validate_block_byte_count, validate_decode_output_len,
+    DecodeReadOptions, Window,
 };
 
 pub(crate) fn read_window(
@@ -42,16 +45,26 @@ pub(crate) fn read_window(
     {
         let output = Mutex::new(output.as_mut_slice());
         relevant_specs.par_iter().try_for_each(|&spec| {
-            let block = read_strip_block(source, ifd_offset, cache, spec, &context, options)?;
-            copy_strip_window_block(&mut output.lock(), block.as_slice(), spec, &layout, window)?;
+            let (block, block_spec) = read_strip_block_for_window(
+                source, ifd_offset, cache, spec, &context, window, options,
+            )?;
+            copy_strip_window_block(
+                &mut output.lock(),
+                block.as_slice(),
+                block_spec,
+                &layout,
+                window,
+            )?;
             Ok::<(), Error>(())
         })?;
     }
 
     #[cfg(not(feature = "rayon"))]
     for spec in relevant_specs {
-        let block = read_strip_block(source, ifd_offset, cache, spec, &context, options)?;
-        copy_strip_window_block(&mut output, block.as_slice(), spec, &layout, window)?;
+        let (block, block_spec) = read_strip_block_for_window(
+            source, ifd_offset, cache, spec, &context, window, options,
+        )?;
+        copy_strip_window_block(&mut output, block.as_slice(), block_spec, &layout, window)?;
     }
 
     Ok(output)
@@ -88,11 +101,13 @@ pub(crate) fn read_window_band(
     {
         let output = Mutex::new(output.as_mut_slice());
         relevant_specs.par_iter().try_for_each(|&spec| {
-            let block = read_strip_block(source, ifd_offset, cache, spec, &context, options)?;
+            let (block, block_spec) = read_strip_block_for_window(
+                source, ifd_offset, cache, spec, &context, window, options,
+            )?;
             copy_strip_band_window_block(
                 &mut output.lock(),
                 block.as_slice(),
-                spec,
+                block_spec,
                 &layout,
                 window,
                 band_index,
@@ -103,11 +118,13 @@ pub(crate) fn read_window_band(
 
     #[cfg(not(feature = "rayon"))]
     for spec in relevant_specs {
-        let block = read_strip_block(source, ifd_offset, cache, spec, &context, options)?;
+        let (block, block_spec) = read_strip_block_for_window(
+            source, ifd_offset, cache, spec, &context, window, options,
+        )?;
         copy_strip_band_window_block(
             &mut output,
             block.as_slice(),
-            spec,
+            block_spec,
             &layout,
             window,
             band_index,
@@ -451,4 +468,181 @@ fn read_strip_block(
         block_height: spec.rows_in_strip,
     })?;
     Ok(cache.insert(cache_key, decoded))
+}
+
+/// Fetches the decoded block for `spec`, bounded to the rows `window`
+/// actually needs when the strip is eligible for the bounded scanline path
+/// (see [`read_strip_block_bounded`]); otherwise falls back to
+/// [`read_strip_block`]'s whole-strip, cached read.
+///
+/// Returns the decoded bytes alongside a `StripBlockSpec` describing which
+/// rows those bytes actually cover -- callers must use the returned spec
+/// (not the original) when copying rows out of the block, since a bounded
+/// read's block only contains `window`'s rows, not the full strip.
+fn read_strip_block_for_window(
+    source: &dyn TiffSource,
+    ifd_offset: u64,
+    cache: &BlockCache,
+    spec: StripBlockSpec,
+    context: &block_decode::BlockDecodeContext<'_>,
+    window: Window,
+    options: DecodeReadOptions<'_>,
+) -> Result<(Arc<Vec<u8>>, StripBlockSpec)> {
+    if let Some(bounded) = read_strip_block_bounded(source, spec, context, window, options)? {
+        return Ok(bounded);
+    }
+    let block = read_strip_block(source, ifd_offset, cache, spec, context, options)?;
+    Ok((block, spec))
+}
+
+/// Bounded single-giant-strip scanline read.
+///
+/// Trigger: a chunky or per-plane strip that spans the *whole* image
+/// (`spec.row_start == 0 && spec.rows_in_strip == layout.height`, i.e.
+/// `strips_per_plane == 1` for this plane) with `Compression::None`, and
+/// not subsampled non-JPEG YCbCr (whose on-disk row layout groups multiple
+/// output rows into one chroma-subsampling unit, so a linear
+/// `offset + row * row_bytes` seek does not correspond to a row boundary).
+///
+/// For an eligible strip, only the byte range covering `window`'s rows is
+/// read from `source` and decoded -- never the whole strip -- and the
+/// result is **not** cached under the strip's cache key: a single giant
+/// strip has only one strip index, so caching a partial-row decode there
+/// would silently serve stale/incomplete rows to a later request for a
+/// *different* row range within the same strip. Returns `Ok(None)` when
+/// the strip is not eligible, so the caller falls back to the existing
+/// whole-strip, cached path unchanged.
+///
+/// Uncompressed TIFF decode is row-independent (byte-order swap, sub-byte
+/// unpack, and the TIFF horizontal/floating-point predictors all reset at
+/// the start of every row -- see `block_decode::decode_compressed_block`'s
+/// `decoded.chunks_exact_mut(row_bytes)` loop), so decoding a contiguous
+/// row sub-range yields byte-identical rows to decoding the whole strip.
+fn read_strip_block_bounded(
+    source: &dyn TiffSource,
+    spec: StripBlockSpec,
+    context: &block_decode::BlockDecodeContext<'_>,
+    window: Window,
+    options: DecodeReadOptions<'_>,
+) -> Result<Option<(Arc<Vec<u8>>, StripBlockSpec)>> {
+    // GDAL-wrapped blocks carry a size-prefix/trailer around the payload;
+    // a linear row-range seek would land inside that framing, not at a row
+    // boundary.
+    if options.gdal_structural_metadata.is_some() {
+        return Ok(None);
+    }
+    if context.compression != Some(Compression::None) {
+        return Ok(None);
+    }
+    let layout = &context.layout;
+    if spec.row_start != 0 || spec.rows_in_strip != layout.height {
+        return Ok(None);
+    }
+    if context.is_subsampled_ycbcr_non_jpeg() {
+        return Ok(None);
+    }
+
+    // Validate the strip's declared on-disk byte count against the SAME
+    // full-strip budget the whole-strip path enforces, so a malformed or
+    // oversized `StripByteCounts` value is rejected with the identical
+    // "block read budget" error, before any bytes are read -- regardless
+    // of how small the bounded sub-range we actually need happens to be.
+    let full_decode_request = block_decode::BlockDecodeRequest {
+        context,
+        compressed: &[],
+        index: spec.index,
+        block_width: layout.width,
+        block_height: spec.rows_in_strip,
+    };
+    let full_byte_count_limit =
+        block_decode::compressed_block_byte_count_limit(&full_decode_request)?;
+    validate_block_byte_count(spec.index, spec.byte_count, full_byte_count_limit)?;
+
+    let row_bytes = if layout.bits_per_sample < 8 {
+        if layout.planar_configuration == 1 {
+            layout.checked_packed_row_bytes()?
+        } else {
+            layout.checked_packed_sample_plane_row_bytes()?
+        }
+    } else if layout.planar_configuration == 1 {
+        layout.checked_row_bytes()?
+    } else {
+        layout.checked_sample_plane_row_bytes()?
+    };
+
+    let block_row_end = checked_layout_add(spec.row_start, spec.rows_in_strip, "strip row range")?;
+    let clip_row_start = spec.row_start.max(window.row_off);
+    let clip_row_end = block_row_end.min(window.row_end());
+    if clip_row_end <= clip_row_start {
+        return Ok(None);
+    }
+    let clip_rows = clip_row_end - clip_row_start;
+    let row_offset_in_strip = clip_row_start - spec.row_start;
+
+    let byte_offset_in_strip =
+        checked_layout_mul(row_offset_in_strip, row_bytes, "strip bounded byte offset")?;
+    let byte_len = checked_layout_mul(clip_rows, row_bytes, "strip bounded byte length")?;
+
+    // Safety net: only take the bounded path when the computed byte range
+    // stays within the strip's declared on-disk extent. If metadata is
+    // unusual enough that it wouldn't (e.g. a StripByteCounts value smaller
+    // than the exact expected size), defer to the whole-strip path so that
+    // edge-case/malformed-metadata behavior is completely unchanged.
+    let byte_offset_in_strip_u64 = byte_offset_in_strip as u64;
+    let byte_len_u64 = byte_len as u64;
+    let fits_declared_extent = spec
+        .offset
+        .checked_add(spec.byte_count)
+        .zip(
+            spec.offset
+                .checked_add(byte_offset_in_strip_u64)
+                .and_then(|v| v.checked_add(byte_len_u64)),
+        )
+        .is_some_and(|(strip_end, bounded_end)| bounded_end <= strip_end);
+    if !fits_declared_extent {
+        return Ok(None);
+    }
+
+    let decode_request = block_decode::BlockDecodeRequest {
+        context,
+        compressed: &[],
+        index: spec.index,
+        block_width: layout.width,
+        block_height: clip_rows,
+    };
+    let decoded_len = block_decode::decoded_block_len(&decode_request)?;
+    validate_decode_output_len(decoded_len, options.decode_output_bytes)?;
+
+    let clipped_spec = StripBlockSpec {
+        row_start: clip_row_start,
+        rows_in_strip: clip_rows,
+        ..spec
+    };
+
+    // GDAL SPARSE_OK semantics: a block with no on-disk payload (zero
+    // offset or zero byte count) decodes as implicit zero fill.
+    if spec.offset == 0 || spec.byte_count == 0 {
+        let decoded = allocate_decode_output(decoded_len, options.decode_output_bytes)?;
+        return Ok(Some((Arc::new(decoded), clipped_spec)));
+    }
+
+    let byte_offset = spec.offset + byte_offset_in_strip_u64;
+    let byte_count_limit = block_decode::compressed_block_byte_count_limit(&decode_request)?;
+    let compressed = read_block_payload(
+        source,
+        byte_offset,
+        byte_len_u64,
+        byte_count_limit,
+        spec.index,
+    )?;
+
+    let decoded = block_decode::decode_compressed_block(block_decode::BlockDecodeRequest {
+        context,
+        compressed: &compressed,
+        index: spec.index,
+        block_width: layout.width,
+        block_height: clip_rows,
+    })?;
+
+    Ok(Some((Arc::new(decoded), clipped_spec)))
 }

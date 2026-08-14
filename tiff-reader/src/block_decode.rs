@@ -54,7 +54,7 @@ impl<'a> BlockDecodeContext<'a> {
         }
     }
 
-    fn is_subsampled_ycbcr_non_jpeg(&self) -> bool {
+    pub(crate) fn is_subsampled_ycbcr_non_jpeg(&self) -> bool {
         matches!(
             &self.color_model,
             ColorModel::YCbCr {

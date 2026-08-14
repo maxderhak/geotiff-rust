@@ -373,7 +373,7 @@ fn read_wrapped_gdal_block(
     Ok(payload.to_vec())
 }
 
-fn validate_block_byte_count(
+pub(crate) fn validate_block_byte_count(
     index: usize,
     byte_count: u64,
     byte_count_limit: usize,
