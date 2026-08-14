@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- write sub-byte (1/2/4-bit) `BitsPerSample` rasters: `ImageBuilder::bits_per_sample(1 | 2 | 4)` now validates (requiring `SampleFormat::Uint`, `Predictor::None`, and non-LERC compression) instead of being hard-rejected, and `tiff_writer::compress::compress_block` packs samples MSB-first per row via `tiff_core::RasterLayout`'s packed-row helpers before compression (None/LZW/Deflate/Zstd); covers chunky, planar-separate (including `RowsPerStrip=1` line-interleaved), and tiled layouts, byte-exact round-trip against the existing sub-byte reader support; `BlockEncodingOptions` gains a `bits_per_sample` field
+
 ## 0.8.1 - 2026-08-11
 
 - support COG writing on `wasm32-unknown-unknown` by staging blocks and raw tiles in memory while retaining temporary-file spooling on native targets

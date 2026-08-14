@@ -541,11 +541,29 @@ impl ImageBuilder {
             ));
         }
         self.validate_extra_tags()?;
-        if !matches!(self.bits_per_sample, 8 | 16 | 32 | 64) {
+        if !matches!(self.bits_per_sample, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
             return Err(crate::error::Error::InvalidConfig(format!(
-                "bits_per_sample must be 8, 16, 32, or 64, got {}",
+                "bits_per_sample must be 1, 2, 4, 8, 16, 32, or 64, got {}",
                 self.bits_per_sample
             )));
+        }
+        if matches!(self.bits_per_sample, 1 | 2 | 4) {
+            if !matches!(self.sample_format, SampleFormat::Uint) {
+                return Err(crate::error::Error::InvalidConfig(format!(
+                    "sub-byte (1/2/4-bit) samples require SampleFormat::Uint, got {:?}",
+                    self.sample_format
+                )));
+            }
+            if !matches!(self.predictor, Predictor::None) {
+                return Err(crate::error::Error::InvalidConfig(
+                    "sub-byte (1/2/4-bit) samples do not support TIFF predictors".into(),
+                ));
+            }
+            if matches!(self.compression, Compression::Lerc) {
+                return Err(crate::error::Error::InvalidConfig(
+                    "LERC compression does not support sub-byte (1/2/4-bit) samples".into(),
+                ));
+            }
         }
         match self.layout {
             DataLayout::Strips { rows_per_strip: 0 } => {

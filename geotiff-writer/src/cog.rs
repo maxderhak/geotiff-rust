@@ -564,6 +564,7 @@ fn compress_cog_block<T: NumericSample>(
                 jpeg_options: encoding.jpeg_options.as_ref(),
                 jpeg_sampling: encoding.jpeg_sampling,
                 deflate_level: encoding.deflate_level,
+                bits_per_sample: T::BITS_PER_SAMPLE,
             },
             block_index,
         )

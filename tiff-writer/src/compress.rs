@@ -25,6 +25,12 @@ pub struct BlockEncodingOptions<'a> {
     pub jpeg_sampling: Option<[u16; 2]>,
     /// Deflate level (0-9) for `Deflate`/`DeflateOld`; `None` uses the codec default.
     pub deflate_level: Option<u32>,
+    /// The `BitsPerSample` value configured on the `ImageBuilder`.
+    ///
+    /// Normally equal to `T::BITS_PER_SAMPLE`. When it is 1, 2, or 4 (and `T`
+    /// is an 8-bit unsigned sample type), the block is bit-packed MSB-first
+    /// instead of encoded one byte per sample; see [`pack_subbyte_rows`].
+    pub bits_per_sample: u16,
 }
 
 /// Full compression pipeline: native samples → file-order bytes → predictor → compress.
@@ -42,6 +48,7 @@ pub fn compress_block<T: TiffWriteSample>(
         jpeg_options,
         jpeg_sampling,
         deflate_level,
+        bits_per_sample,
     } = options;
 
     validate_deflate_level(compression, deflate_level, index)?;
@@ -53,6 +60,26 @@ pub fn compress_block<T: TiffWriteSample>(
                     .into(),
         });
     }
+
+    if bits_per_sample < 8 {
+        if !matches!(predictor, Predictor::None) {
+            return Err(Error::CompressionFailed {
+                index,
+                reason: "TIFF predictors are not supported for sub-byte (1/2/4-bit) samples".into(),
+            });
+        }
+        return compress_block_subbyte::<T>(
+            samples,
+            byte_order,
+            bits_per_sample,
+            samples_per_pixel,
+            row_width_pixels,
+            compression,
+            deflate_level,
+            index,
+        );
+    }
+
     match predictor {
         Predictor::Horizontal if T::SAMPLE_FORMAT == 3 => {
             return Err(Error::CompressionFailed {
@@ -126,6 +153,146 @@ pub fn compress_block<T: TiffWriteSample>(
         )?;
     }
     compress_with_level(&encoded, compression, deflate_level, index)
+}
+
+/// Compression pipeline for sub-byte (1/2/4-bit) samples: pack MSB-first
+/// into bytes per row, then compress (no predictor, no JPEG/LERC).
+///
+/// `T` must be an 8-bit unsigned sample type (each element one logical
+/// sample value in `0..2^bits_per_sample`); `compress_block` enforces this
+/// before calling here.
+#[allow(clippy::too_many_arguments)]
+fn compress_block_subbyte<T: TiffWriteSample>(
+    samples: &[T],
+    byte_order: ByteOrder,
+    bits_per_sample: u16,
+    samples_per_pixel: u16,
+    row_width_pixels: usize,
+    compression: Compression,
+    deflate_level: Option<u32>,
+    index: usize,
+) -> Result<Vec<u8>> {
+    if T::BITS_PER_SAMPLE != 8 || T::SAMPLE_FORMAT != 1 {
+        return Err(Error::CompressionFailed {
+            index,
+            reason: format!(
+                "sub-byte (1/2/4-bit) samples require an 8-bit unsigned Rust sample type, \
+                 got sample_format={} bits_per_sample={}",
+                T::SAMPLE_FORMAT,
+                T::BITS_PER_SAMPLE
+            ),
+        });
+    }
+    if !(matches!(
+        compression,
+        Compression::None | Compression::Lzw | Compression::Deflate | Compression::DeflateOld
+    ) || (matches!(compression, Compression::Zstd) && cfg!(feature = "zstd")))
+    {
+        return Err(Error::CompressionFailed {
+            index,
+            reason: format!(
+                "{compression:?} compression does not support sub-byte (1/2/4-bit) samples"
+            ),
+        });
+    }
+
+    let byte_values = T::encode_slice(samples, byte_order);
+    let packed = pack_subbyte_rows(
+        &byte_values,
+        bits_per_sample,
+        samples_per_pixel,
+        row_width_pixels,
+        index,
+    )?;
+    compress_with_level(&packed, compression, deflate_level, index)
+}
+
+/// Pack one-byte-per-sample values (each `< 2^bits_per_sample`) into
+/// MSB-first bit-packed row bytes.
+///
+/// This is the exact inverse of the fork reader's `unpack_subbyte_block`
+/// (tiff-reader/src/block_decode.rs): sample `i` within a row lands in byte
+/// `i / samples_per_byte` at bit offset `8 - bits_per_sample * ((i %
+/// samples_per_byte) + 1)`, i.e. the first sample in a byte occupies its
+/// most-significant bits.
+///
+/// Row byte-sizing is computed via `tiff_core::RasterLayout`'s packed
+/// helpers rather than reimplemented here.
+fn pack_subbyte_rows(
+    samples: &[u8],
+    bits_per_sample: u16,
+    samples_per_pixel: u16,
+    row_width_pixels: usize,
+    index: usize,
+) -> Result<Vec<u8>> {
+    debug_assert!(matches!(bits_per_sample, 1 | 2 | 4));
+
+    let row_samples = row_width_pixels
+        .checked_mul(usize::from(samples_per_pixel))
+        .ok_or_else(|| Error::CompressionFailed {
+            index,
+            reason: "sub-byte row sample count overflows usize".into(),
+        })?;
+    if row_samples == 0 {
+        return Err(Error::CompressionFailed {
+            index,
+            reason: "block row width and samples per pixel must be greater than zero".into(),
+        });
+    }
+    if samples.len() % row_samples != 0 {
+        return Err(Error::CompressionFailed {
+            index,
+            reason: format!(
+                "sub-byte block sample count {} is not divisible by row sample count {row_samples}",
+                samples.len()
+            ),
+        });
+    }
+
+    let layout = tiff_core::RasterLayout {
+        width: row_width_pixels,
+        height: 1,
+        samples_per_pixel: usize::from(samples_per_pixel),
+        bits_per_sample,
+        bytes_per_sample: 1,
+        sample_format: 1,
+        planar_configuration: 1,
+        predictor: 1,
+    };
+    let row_bytes = layout
+        .checked_packed_row_bytes_for_width(row_width_pixels)
+        .map_err(|e| Error::CompressionFailed {
+            index,
+            reason: format!("packed row byte count: {e}"),
+        })?;
+
+    let num_rows = samples.len() / row_samples;
+    let total_bytes = row_bytes
+        .checked_mul(num_rows)
+        .ok_or_else(|| Error::CompressionFailed {
+            index,
+            reason: "packed block byte count overflows usize".into(),
+        })?;
+
+    let samples_per_byte = 8 / bits_per_sample as usize;
+    let max_value = ((1u16 << bits_per_sample) - 1) as u8;
+    let mut packed = vec![0u8; total_bytes];
+    for (row_index, row) in samples.chunks_exact(row_samples).enumerate() {
+        let out_row = &mut packed[row_index * row_bytes..(row_index + 1) * row_bytes];
+        for (sample_index, &value) in row.iter().enumerate() {
+            if value > max_value {
+                return Err(Error::CompressionFailed {
+                    index,
+                    reason: format!(
+                        "sample value {value} exceeds the {bits_per_sample}-bit range (max {max_value})"
+                    ),
+                });
+            }
+            let shift = 8 - bits_per_sample as usize * ((sample_index % samples_per_byte) + 1);
+            out_row[sample_index / samples_per_byte] |= value << shift;
+        }
+    }
+    Ok(packed)
 }
 
 #[cfg(feature = "jpeg")]
@@ -663,6 +830,7 @@ mod tests {
             jpeg_options: None,
             jpeg_sampling: None,
             deflate_level: None,
+            bits_per_sample: 8,
         };
         let error = compress_block(&[1u8, 2, 3], options, 4).unwrap_err();
         assert!(
