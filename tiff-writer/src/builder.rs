@@ -801,15 +801,7 @@ impl ImageBuilder {
                 1
             }
             PhotometricInterpretation::Mask => 1,
-            PhotometricInterpretation::Separated => match self.ink_set.unwrap_or(InkSet::Cmyk) {
-                InkSet::Cmyk => 4,
-                InkSet::NotCmyk | InkSet::Unknown(_) => {
-                    return Err(crate::error::Error::InvalidConfig(
-                        "separated photometric interpretation currently requires InkSet::Cmyk"
-                            .into(),
-                    ))
-                }
-            },
+            PhotometricInterpretation::Separated => self.separated_base_samples()?,
             PhotometricInterpretation::YCbCr => 3,
             PhotometricInterpretation::CieLab => 3,
         };
@@ -848,11 +840,49 @@ impl ImageBuilder {
             PhotometricInterpretation::Rgb => 3,
             PhotometricInterpretation::Palette => 1,
             PhotometricInterpretation::Mask => 1,
-            PhotometricInterpretation::Separated => 4,
+            PhotometricInterpretation::Separated => self.separated_base_samples()?,
             PhotometricInterpretation::YCbCr => 3,
             PhotometricInterpretation::CieLab => 3,
         };
         self.effective_extra_samples_for_base(base_samples)
+    }
+
+    /// Number of base ink channels for `Separated` photometric data.
+    ///
+    /// `InkSet::Cmyk` (or an absent InkSet, which defaults to Cmyk) is the
+    /// fixed 4-ink model, matching the reader's `ColorModel::Cmyk` path.
+    /// For `InkSet::NotCmyk` / `InkSet::Unknown(_)` the ink count is
+    /// *implicit* — there is no `NumberOfInks` tag in this fork — so it is
+    /// derived the same way the reader derives `color_channels`:
+    /// `samples_per_pixel - extra_samples.len()`, which must be at least 1.
+    /// Both `validate_color_model` and `effective_extra_samples` call this
+    /// so the two Separated arms stay consistent.
+    fn separated_base_samples(&self) -> crate::error::Result<u16> {
+        match self.ink_set.unwrap_or(InkSet::Cmyk) {
+            InkSet::Cmyk => Ok(4),
+            InkSet::NotCmyk | InkSet::Unknown(_) => {
+                let extra_len = u16::try_from(self.extra_samples.len()).map_err(|_| {
+                    crate::error::Error::InvalidConfig(format!(
+                        "separated photometric interpretation has {} ExtraSamples, which exceeds u16",
+                        self.extra_samples.len()
+                    ))
+                })?;
+                let base_samples = self.samples_per_pixel.checked_sub(extra_len).ok_or_else(|| {
+                    crate::error::Error::InvalidConfig(format!(
+                        "separated photometric interpretation has {} total channels but {} ExtraSamples",
+                        self.samples_per_pixel,
+                        self.extra_samples.len()
+                    ))
+                })?;
+                if base_samples == 0 {
+                    return Err(crate::error::Error::InvalidConfig(
+                        "separated photometric interpretation must have at least one base ink channel"
+                            .into(),
+                    ));
+                }
+                Ok(base_samples)
+            }
+        }
     }
 
     fn effective_extra_samples_for_base(

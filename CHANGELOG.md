@@ -3,6 +3,7 @@
 ## Unreleased
 
 - write sub-byte (1/2/4-bit) `BitsPerSample` rasters: `ImageBuilder::bits_per_sample(1 | 2 | 4)` now validates (requiring `SampleFormat::Uint`, `Predictor::None`, and non-LERC compression) instead of being hard-rejected, and `tiff_writer::compress::compress_block` packs samples MSB-first per row via `tiff_core::RasterLayout`'s packed-row helpers before compression (None/LZW/Deflate/Zstd); covers chunky, planar-separate (including `RowsPerStrip=1` line-interleaved), and tiled layouts, byte-exact round-trip against the existing sub-byte reader support; `BlockEncodingOptions` gains a `bits_per_sample` field
+- write `Separated` (photometric=5) images with an arbitrary ink count (not just CMYK's fixed 4): `InkSet::NotCmyk`/`InkSet::Unknown(_)` now derive the base ink channel count as `samples_per_pixel - extra_samples.len()` (requiring at least 1), mirroring how the reader already computes `ColorModel::Separated`'s `color_channels`; there is still no `NumberOfInks` tag — the ink count stays implicit, matching the reader, so write/read stay symmetric. `InkSet::Cmyk` (and the absent-InkSet default) is unchanged: still a fixed 4 base inks with the remainder as `ExtraSamples`. Both `ImageBuilder::validate_color_model` and `effective_extra_samples` now share one `separated_base_samples` helper instead of hardcoding 4 independently
 
 ## 0.8.1 - 2026-08-11
 
