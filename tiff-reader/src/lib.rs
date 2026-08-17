@@ -682,10 +682,22 @@ impl TiffFile {
     ///
     /// Identical to [`read_image_bytes`](Self::read_image_bytes) except that
     /// sub-byte samples (1/2/4 bits) are returned in their packed, MSB-first
-    /// on-disk representation (`ceil(width * samples_per_pixel * bits / 8)`
-    /// bytes per row) rather than expanded to one byte per sample. For
+    /// representation (`ceil(width * samples_per_pixel * bits / 8)` bytes per
+    /// interleaved row) rather than expanded to one byte per sample. For
     /// byte-aligned depths (8/16/32/64 bits) the packed bytes are identical to
     /// the unpacked storage bytes, so callers can use one path for all depths.
+    ///
+    /// The returned sub-byte bytes reproduce the exact on-disk bytes **only for
+    /// chunky ([`PlanarConfiguration::Chunky`]) storage**, whose on-disk layout
+    /// is interleaved. For planar ([`PlanarConfiguration::Planar`],
+    /// `PlanarConfiguration=2`) sub-byte storage this method returns
+    /// [`Err`]`(`[`Error::InvalidImageLayout`]`)` rather than silently
+    /// re-interleaving the planes: the on-disk layout is per-plane, so use the
+    /// per-band packed accessors
+    /// ([`read_band_packed_bytes`](Self::read_band_packed_bytes) /
+    /// [`read_band_window_packed_bytes`](Self::read_band_window_packed_bytes))
+    /// to obtain the byte-exact per-plane packed bytes. Byte-aligned (bits >= 8)
+    /// planar storage is unaffected.
     ///
     /// Compression is still decompressed; only the sub-byte bit-unpack is
     /// skipped. The read stays bounded to the strips/tiles the image occupies.
@@ -711,10 +723,15 @@ impl TiffFile {
     /// Decode a pixel window into raw on-disk **packed** storage bytes.
     ///
     /// See [`read_image_packed_bytes`](Self::read_image_packed_bytes) for the
-    /// packed-vs-unpacked contract. Sub-byte rows are packed as
-    /// `ceil(cols * samples_per_pixel * bits / 8)` MSB-first bytes; a
-    /// full-width window (`col_off == 0`, `cols == width`) reproduces the
-    /// exact on-disk bytes.
+    /// packed-vs-unpacked contract, including the planar sub-byte rejection
+    /// (this method also returns [`Err`]`(`[`Error::InvalidImageLayout`]`)` for
+    /// planar sub-byte storage — use the per-band packed accessors there).
+    /// Sub-byte rows are packed as `ceil(cols * samples_per_pixel * bits / 8)`
+    /// MSB-first bytes. A full-width window (`col_off == 0`, `cols == width`) on
+    /// chunky storage reproduces the exact on-disk bytes; with `col_off > 0` or
+    /// `cols < width`, sub-byte samples are re-packed starting fresh at bit 0 of
+    /// each output row (a valid packed representation of the sub-window, not a
+    /// copy of a mid-byte on-disk range).
     pub fn read_window_packed_bytes(
         &self,
         ifd_index: usize,
@@ -746,7 +763,11 @@ impl TiffFile {
     ///
     /// Sub-byte bands are packed as `ceil(cols * bits / 8)` MSB-first bytes per
     /// sample-plane row (the per-plane on-disk layout for planar images); a
-    /// full-width read reproduces that plane's exact on-disk bytes.
+    /// full-width read (`col_off == 0`, `cols == width`) reproduces that plane's
+    /// exact on-disk bytes. With `col_off > 0` or `cols < width`, sub-byte
+    /// samples are re-packed starting fresh at bit 0 of each output row (not a
+    /// copy of a mid-byte on-disk range). Unlike the non-band packed accessors,
+    /// this works for both chunky and planar storage.
     pub fn read_band_packed_bytes(&self, ifd_index: usize, band_index: usize) -> Result<Vec<u8>> {
         let ifd = self.ifd(ifd_index)?;
         self.read_band_packed_bytes_from_ifd(ifd, band_index)
@@ -870,6 +891,20 @@ impl TiffFile {
             return Ok(Vec::new());
         }
         let layout = ifd.raster_layout()?;
+        // Planar (PlanarConfiguration=2) sub-byte storage is per-plane on disk,
+        // but the interleaved window decode re-interleaves the planes. Emitting
+        // an interleaved re-packing here would silently NOT match the on-disk
+        // per-plane bytes, so reject it loudly and point at the per-band packed
+        // accessors instead. Byte-aligned (>=8-bit) planar storage is fine.
+        if layout.bits_per_sample < 8 && layout.planar_configuration != 1 {
+            return Err(Error::InvalidImageLayout(format!(
+                "packed sub-byte read on planar (PlanarConfiguration={}) storage would \
+                 re-interleave the planes and not match the on-disk per-plane bytes; use the \
+                 per-band packed accessors (read_band_packed_bytes / \
+                 read_band_window_packed_bytes)",
+                layout.planar_configuration
+            )));
+        }
         let unpacked = self.decode_window_sample_bytes(ifd, window)?;
         if layout.bits_per_sample >= 8 {
             return Ok(unpacked);

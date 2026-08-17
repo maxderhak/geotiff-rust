@@ -181,6 +181,111 @@ fn assert_packed_equals_unpacked(
     }
 }
 
+/// The non-band packed accessors must LOUDLY reject planar sub-byte storage
+/// (whose on-disk layout is per-plane) rather than silently returning
+/// re-interleaved bytes. The per-band accessors remain the supported path.
+#[test]
+fn planar_subbyte_non_band_packed_read_is_rejected() {
+    let width: u32 = 5;
+    let height: u32 = 3;
+    let samples_per_pixel: u16 = 4;
+
+    let band_rows: [[[u8; 5]; 3]; 4] = [
+        [[0, 1, 2, 3, 0], [3, 2, 1, 0, 1], [1, 1, 2, 2, 3]],
+        [[3, 3, 3, 3, 3], [0, 0, 0, 0, 0], [2, 0, 1, 3, 2]],
+        [[1, 0, 3, 2, 1], [2, 1, 0, 3, 2], [0, 3, 1, 2, 0]],
+        [[2, 2, 0, 1, 3], [1, 3, 2, 0, 1], [3, 0, 2, 1, 0]],
+    ];
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut writer = TiffWriter::new(&mut buf, WriteOptions::default()).unwrap();
+    let image = ImageBuilder::new(width, height)
+        .bits_per_sample(2)
+        .samples_per_pixel(samples_per_pixel)
+        .planar_configuration(PlanarConfiguration::Planar)
+        .strips(1);
+    let handle = writer.add_image(image).unwrap();
+    for (band, rows) in band_rows.iter().enumerate() {
+        for (row, values) in rows.iter().enumerate() {
+            let block_index = band * height as usize + row;
+            writer.write_block(&handle, block_index, values).unwrap();
+        }
+    }
+    writer.finish().unwrap();
+
+    let file = TiffFile::from_bytes(buf.into_inner()).unwrap();
+
+    for result in [
+        file.read_image_packed_bytes(0),
+        file.read_window_packed_bytes(0, 0, 0, height as usize, width as usize),
+    ] {
+        let err = result.expect_err("planar sub-byte non-band packed read must error");
+        match err {
+            tiff_reader::TiffError::InvalidImageLayout(msg) => {
+                assert!(
+                    msg.contains("per-band packed accessors"),
+                    "error must direct caller to the per-band packed accessors, got: {msg}"
+                );
+                assert!(
+                    msg.contains("PlanarConfiguration"),
+                    "error must name the offending planar configuration, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidImageLayout, got {other:?}"),
+        }
+    }
+
+    // The supported per-band path still works and is byte-exact.
+    for (band, rows) in band_rows.iter().enumerate() {
+        let flat: Vec<u8> = rows.iter().flatten().copied().collect();
+        let expected = pack_msb_first(&flat, width as usize, height as usize, 2);
+        let packed = file.read_band_packed_bytes(0, band).unwrap();
+        assert_eq!(
+            packed, expected,
+            "band {band} per-band packed read must still work"
+        );
+    }
+}
+
+/// A sub-byte column sub-window (`col_off > 0` / partial width) re-packs the
+/// selected samples starting fresh at bit 0 of each output row — a valid packed
+/// representation of the sub-window, pinned here so the behavior tied to the
+/// planar guard is locked down.
+#[test]
+fn subbyte_col_offset_repacks_from_bit_zero() {
+    // 4-bit, single-band, 6 wide x 2 rows chunky.
+    let width: u32 = 6;
+    let height: u32 = 2;
+    let values: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut writer = TiffWriter::new(&mut buf, WriteOptions::default()).unwrap();
+    let image = ImageBuilder::new(width, height)
+        .bits_per_sample(4)
+        .strips(height);
+    let handle = writer.add_image(image).unwrap();
+    writer.write_block(&handle, 0, &values).unwrap();
+    writer.finish().unwrap();
+
+    let file = TiffFile::from_bytes(buf.into_inner()).unwrap();
+
+    // Window cols [2..5) of each row: row0 -> [3,4,5], row1 -> [9,10,11].
+    let col_off = 2usize;
+    let cols = 3usize;
+    let sub: Vec<u8> = vec![3, 4, 5, 9, 10, 11];
+    let expected = pack_msb_first(&sub, cols, height as usize, 4);
+    // 3 samples * 4 bits = 12 bits -> 2 bytes per row, fresh from bit 0.
+    assert_eq!(expected.len(), 2 * height as usize);
+
+    let packed = file
+        .read_window_packed_bytes(0, 0, col_off, height as usize, cols)
+        .unwrap();
+    assert_eq!(
+        packed, expected,
+        "col_off>0 sub-byte window must re-pack the sub-window fresh from bit 0"
+    );
+}
+
 /// For byte-aligned depths, the packed API returns the identical bytes to the
 /// existing unpacked storage-byte API. Proven for both 8-bit and 16-bit, for
 /// the whole-window and single-band views.
