@@ -283,7 +283,7 @@ pub(crate) fn decode_pixels(
                 );
             }
         }
-        ColorModel::CieLab { extra_samples } => {
+        ColorModel::CieLab { extra_samples } | ColorModel::IccLab { extra_samples } => {
             for pixel in 0..pixel_count {
                 for channel in 0..3 {
                     let value = read_uint_sample(sample_bytes, storage_layout, pixel, channel);
@@ -336,7 +336,8 @@ fn can_passthrough(
         | ColorModel::Rgb { .. }
         | ColorModel::TransparencyMask
         | ColorModel::Separated { .. }
-        | ColorModel::CieLab { .. } => true,
+        | ColorModel::CieLab { .. }
+        | ColorModel::IccLab { .. } => true,
         ColorModel::YCbCr { .. } => {
             Compression::from_code(ifd.compression()) == Some(Compression::Jpeg)
         }

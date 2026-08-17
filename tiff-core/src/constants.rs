@@ -160,6 +160,10 @@ pub enum PhotometricInterpretation {
     Separated,
     YCbCr,
     CieLab,
+    /// ICC L*a*b* encoding (TIFF photometric 9). Same three-channel storage
+    /// layout as `CieLab`, but the a*/b* samples use the unsigned ICC encoding
+    /// rather than CIELab's signed encoding.
+    IccLab,
 }
 
 impl PhotometricInterpretation {
@@ -173,6 +177,7 @@ impl PhotometricInterpretation {
             5 => Some(Self::Separated),
             6 => Some(Self::YCbCr),
             8 => Some(Self::CieLab),
+            9 => Some(Self::IccLab),
             _ => None,
         }
     }
@@ -187,6 +192,7 @@ impl PhotometricInterpretation {
             Self::Separated => 5,
             Self::YCbCr => 6,
             Self::CieLab => 8,
+            Self::IccLab => 9,
         }
     }
 }
@@ -369,6 +375,13 @@ pub enum ColorModel {
     CieLab {
         extra_samples: Vec<ExtraSample>,
     },
+    /// ICC L*a*b* (TIFF photometric 9). Three base samples (L*, a*, b*) plus
+    /// any extra samples, decoded as raw storage samples exactly like
+    /// [`ColorModel::CieLab`]; the variant is kept distinct so consumers can
+    /// tell the unsigned ICC a*/b* encoding apart from CIELab's signed one.
+    IccLab {
+        extra_samples: Vec<ExtraSample>,
+    },
 }
 
 /// TIFF planar configuration.
@@ -465,6 +478,21 @@ mod tests {
             assert_eq!(PhotometricInterpretation::from_code(code), Some(expected));
             assert_eq!(expected.to_code(), code);
         }
+    }
+
+    #[test]
+    fn photometric_from_code_recognizes_icclab_code_9() {
+        assert!(PhotometricInterpretation::from_code(9).is_some());
+        assert_eq!(
+            PhotometricInterpretation::from_code(9),
+            Some(PhotometricInterpretation::IccLab)
+        );
+        assert_eq!(PhotometricInterpretation::IccLab.to_code(), 9);
+        // ICCLab (9) is distinct from CIELab (8).
+        assert_ne!(
+            PhotometricInterpretation::from_code(9),
+            PhotometricInterpretation::from_code(8)
+        );
     }
 
     #[test]

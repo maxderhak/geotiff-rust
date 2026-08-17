@@ -804,6 +804,7 @@ impl ImageBuilder {
             PhotometricInterpretation::Separated => self.separated_base_samples()?,
             PhotometricInterpretation::YCbCr => 3,
             PhotometricInterpretation::CieLab => 3,
+            PhotometricInterpretation::IccLab => 3,
         };
 
         let _ = self.effective_extra_samples_for_base(base_samples)?;
@@ -843,6 +844,7 @@ impl ImageBuilder {
             PhotometricInterpretation::Separated => self.separated_base_samples()?,
             PhotometricInterpretation::YCbCr => 3,
             PhotometricInterpretation::CieLab => 3,
+            PhotometricInterpretation::IccLab => 3,
         };
         self.effective_extra_samples_for_base(base_samples)
     }
@@ -1004,6 +1006,7 @@ fn photometric_name(photometric: PhotometricInterpretation) -> &'static str {
         PhotometricInterpretation::Separated => "Separated",
         PhotometricInterpretation::YCbCr => "YCbCr",
         PhotometricInterpretation::CieLab => "CIELab",
+        PhotometricInterpretation::IccLab => "ICCLab",
     }
 }
 

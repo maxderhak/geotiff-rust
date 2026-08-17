@@ -459,6 +459,87 @@ fn palette_rgba_cmyk_and_ycbcr_metadata_roundtrip() {
 }
 
 #[test]
+fn icclab_photometric_9_roundtrips_raw_storage_samples() {
+    // 2x1 ICC L*a*b* (photometric 9), 16-bit, three base samples (L*, a*, b*).
+    // The fork must decode photometric 9 and hand back the RAW storage samples
+    // un-canonicalized (v2->v4 canonicalization is a downstream concern), exactly
+    // as it does for CIELab (photometric 8). The chosen a*/b* values (0x8000,
+    // 0x8080, ...) would move under any signed<->unsigned reinterpretation, so a
+    // byte-exact round-trip proves the samples pass through raw.
+    let samples: [u16; 6] = [0x0000, 0x8000, 0x00FF, 0xFFFF, 0x0000, 0x8080];
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut writer = TiffWriter::new(&mut buf, WriteOptions::default()).unwrap();
+    let handle = writer
+        .add_image(
+            ImageBuilder::new(2, 1)
+                .sample_type::<u16>()
+                .samples_per_pixel(3)
+                .photometric(PhotometricInterpretation::IccLab)
+                .strips(1),
+        )
+        .unwrap();
+    writer.write_block(&handle, 0, &samples).unwrap();
+    writer.finish().unwrap();
+
+    let file = TiffFile::from_bytes(buf.into_inner()).unwrap();
+    let ifd = file.ifd(0).unwrap();
+    assert_eq!(
+        ifd.photometric_interpretation(),
+        Some(PhotometricInterpretation::IccLab.to_code())
+    );
+    assert!(matches!(
+        ifd.color_model().unwrap(),
+        ColorModel::IccLab { extra_samples } if extra_samples.is_empty()
+    ));
+
+    let raw = file.read_image::<u16>(0).unwrap();
+    let (raw_values, raw_offset) = raw.into_raw_vec_and_offset();
+    assert_eq!(raw_offset, Some(0));
+    assert_eq!(raw_values, samples.to_vec());
+
+    // Decoded read (16-bit passthrough) matches the raw samples too.
+    let decoded = file.read_decoded_image::<u16>(0).unwrap();
+    let (decoded_values, _) = decoded.into_raw_vec_and_offset();
+    assert_eq!(decoded_values, samples.to_vec());
+}
+
+#[test]
+fn icclab_photometric_9_with_extra_sample_roundtrips() {
+    // ICCLab (photometric 9) with one unassociated-alpha extra sample: 3 base
+    // Lab channels + 1 extra = spp 4. Verifies the extra-sample plumbing mirrors
+    // the CIELab path.
+    let samples: [u8; 4] = [10, 200, 30, 255];
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut writer = TiffWriter::new(&mut buf, WriteOptions::default()).unwrap();
+    let handle = writer
+        .add_image(
+            ImageBuilder::new(1, 1)
+                .sample_type::<u8>()
+                .samples_per_pixel(4)
+                .photometric(PhotometricInterpretation::IccLab)
+                .extra_samples(vec![ExtraSample::UnassociatedAlpha])
+                .strips(1),
+        )
+        .unwrap();
+    writer.write_block(&handle, 0, &samples).unwrap();
+    writer.finish().unwrap();
+
+    let file = TiffFile::from_bytes(buf.into_inner()).unwrap();
+    let ifd = file.ifd(0).unwrap();
+    assert!(matches!(
+        ifd.color_model().unwrap(),
+        ColorModel::IccLab { extra_samples }
+            if extra_samples == vec![ExtraSample::UnassociatedAlpha]
+    ));
+
+    let raw = file.read_image::<u8>(0).unwrap();
+    let (raw_values, _) = raw.into_raw_vec_and_offset();
+    assert_eq!(raw_values, samples.to_vec());
+}
+
+#[test]
 fn multi_ifd_and_planar_rgb_roundtrip() {
     let mut buf = Cursor::new(Vec::new());
     let mut writer = TiffWriter::new(&mut buf, WriteOptions::default()).unwrap();

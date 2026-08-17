@@ -458,6 +458,14 @@ impl Ifd {
                     extra_samples,
                 )?,
             }),
+            PhotometricInterpretation::IccLab => Ok(ColorModel::IccLab {
+                extra_samples: resolve_fixed_model_extra_samples(
+                    photometric,
+                    samples_per_pixel,
+                    3,
+                    extra_samples,
+                )?,
+            }),
         }
     }
 
@@ -584,6 +592,7 @@ impl Ifd {
                 ..
             } => *color_channels as usize + extra_samples.len(),
             ColorModel::CieLab { extra_samples } => 3 + extra_samples.len(),
+            ColorModel::IccLab { extra_samples } => 3 + extra_samples.len(),
             ColorModel::TransparencyMask => 1,
         };
         let (sample_format, bits_per_sample) = match &color_model {
@@ -822,6 +831,7 @@ fn photometric_name(photometric: PhotometricInterpretation) -> &'static str {
         PhotometricInterpretation::Separated => "Separated",
         PhotometricInterpretation::YCbCr => "YCbCr",
         PhotometricInterpretation::CieLab => "CIELab",
+        PhotometricInterpretation::IccLab => "ICCLab",
     }
 }
 
@@ -938,6 +948,9 @@ fn validate_color_model(ifd: &Ifd, samples_per_pixel: usize, bits_per_sample: u1
         ColorModel::CieLab { extra_samples } => {
             validate_expected_samples(samples_per_pixel, 3, extra_samples.len())?;
         }
+        ColorModel::IccLab { extra_samples } => {
+            validate_expected_samples(samples_per_pixel, 3, extra_samples.len())?;
+        }
     }
 
     Ok(())
@@ -1040,10 +1053,10 @@ fn reject_duplicate_tags(tags: &[Tag]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColorModel, ExtraSample, Ifd, InkSet, LercAdditionalCompression, RasterLayout,
-        TAG_BITS_PER_SAMPLE, TAG_COLOR_MAP, TAG_EXTRA_SAMPLES, TAG_IMAGE_LENGTH, TAG_IMAGE_WIDTH,
-        TAG_INK_SET, TAG_LERC_PARAMETERS, TAG_PHOTOMETRIC_INTERPRETATION, TAG_SAMPLES_PER_PIXEL,
-        TAG_SAMPLE_FORMAT, TAG_YCBCR_SUBSAMPLING,
+        ColorModel, ExtraSample, Ifd, InkSet, LercAdditionalCompression, PhotometricInterpretation,
+        RasterLayout, TAG_BITS_PER_SAMPLE, TAG_COLOR_MAP, TAG_EXTRA_SAMPLES, TAG_IMAGE_LENGTH,
+        TAG_IMAGE_WIDTH, TAG_INK_SET, TAG_LERC_PARAMETERS, TAG_PHOTOMETRIC_INTERPRETATION,
+        TAG_SAMPLES_PER_PIXEL, TAG_SAMPLE_FORMAT, TAG_YCBCR_SUBSAMPLING,
     };
     use crate::header::{ByteOrder, TiffHeader};
     use crate::source::BytesSource;
@@ -1249,6 +1262,54 @@ mod tests {
 
         let layout = ifd.raster_layout().unwrap();
         assert_eq!(layout.samples_per_pixel, 2);
+    }
+
+    #[test]
+    fn decodes_icclab_photometric_9_as_three_base_lab_samples() {
+        let ifd = make_ifd(vec![
+            Tag::new(TAG_IMAGE_WIDTH, TagValue::Long(vec![1])),
+            Tag::new(TAG_IMAGE_LENGTH, TagValue::Long(vec![1])),
+            Tag::new(TAG_SAMPLES_PER_PIXEL, TagValue::Short(vec![3])),
+            Tag::new(TAG_BITS_PER_SAMPLE, TagValue::Short(vec![16, 16, 16])),
+            Tag::new(TAG_SAMPLE_FORMAT, TagValue::Short(vec![1, 1, 1])),
+            Tag::new(TAG_PHOTOMETRIC_INTERPRETATION, TagValue::Short(vec![9])),
+        ]);
+
+        let model = ifd
+            .color_model()
+            .expect("ICCLab (photometric 9) must be a supported color model");
+        match model {
+            ColorModel::IccLab { extra_samples } => assert!(extra_samples.is_empty()),
+            other => panic!("expected ICCLab color model, got {other:?}"),
+        }
+        assert_eq!(ifd.raster_layout().unwrap().samples_per_pixel, 3);
+        assert_eq!(ifd.decoded_raster_layout().unwrap().samples_per_pixel, 3);
+        assert_eq!(
+            ifd.photometric_interpretation(),
+            Some(PhotometricInterpretation::IccLab.to_code())
+        );
+    }
+
+    #[test]
+    fn icclab_is_distinct_from_cielab_color_model() {
+        let build = |photometric_code: u16| {
+            make_ifd(vec![
+                Tag::new(TAG_IMAGE_WIDTH, TagValue::Long(vec![1])),
+                Tag::new(TAG_IMAGE_LENGTH, TagValue::Long(vec![1])),
+                Tag::new(TAG_SAMPLES_PER_PIXEL, TagValue::Short(vec![3])),
+                Tag::new(TAG_BITS_PER_SAMPLE, TagValue::Short(vec![16, 16, 16])),
+                Tag::new(TAG_SAMPLE_FORMAT, TagValue::Short(vec![1, 1, 1])),
+                Tag::new(
+                    TAG_PHOTOMETRIC_INTERPRETATION,
+                    TagValue::Short(vec![photometric_code]),
+                ),
+            ])
+            .color_model()
+            .unwrap()
+        };
+
+        assert!(matches!(build(8), ColorModel::CieLab { .. }));
+        assert!(matches!(build(9), ColorModel::IccLab { .. }));
     }
 
     #[test]
