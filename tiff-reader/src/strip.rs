@@ -46,7 +46,7 @@ pub(crate) fn read_window(
         let output = Mutex::new(output.as_mut_slice());
         relevant_specs.par_iter().try_for_each(|&spec| {
             let (block, block_spec) = read_strip_block_for_window(
-                source, ifd_offset, cache, spec, &context, window, options,
+                source, ifd_offset, cache, spec, &context, window, options, false,
             )?;
             copy_strip_window_block(
                 &mut output.lock(),
@@ -62,9 +62,64 @@ pub(crate) fn read_window(
     #[cfg(not(feature = "rayon"))]
     for spec in relevant_specs {
         let (block, block_spec) = read_strip_block_for_window(
-            source, ifd_offset, cache, spec, &context, window, options,
+            source, ifd_offset, cache, spec, &context, window, options, false,
         )?;
         copy_strip_window_block(&mut output, block.as_slice(), block_spec, &layout, window)?;
+    }
+
+    Ok(output)
+}
+
+/// Read a full-width sub-byte window as raw **packed** on-disk rows, verbatim.
+///
+/// Unlike [`read_window`], the sub-byte unpack (and the per-sample re-interleave
+/// copy) is skipped: each strip decodes to its packed rows and whole rows are
+/// copied out, so the trailing padding bits survive byte-exact to disk. Only
+/// valid for chunky (`PlanarConfiguration=1`) sub-byte storage with a
+/// full-width window (`col_off == 0 && cols == width`); the caller
+/// ([`decode_window_packed_bytes`](crate::TiffFile::read_image_packed_bytes))
+/// enforces that and routes every other shape through the re-pack path.
+pub(crate) fn read_window_packed(
+    source: &dyn TiffSource,
+    ifd: &Ifd,
+    byte_order: ByteOrder,
+    cache: &BlockCache,
+    window: Window,
+    options: DecodeReadOptions<'_>,
+) -> Result<Vec<u8>> {
+    let layout = ifd.raster_layout()?;
+    if window.is_empty() {
+        return Ok(Vec::new());
+    }
+    debug_assert_eq!(layout.planar_configuration, 1);
+    debug_assert!(window.col_off == 0 && window.cols == layout.width);
+    let ifd_offset = ifd.offset();
+    let context = block_decode::BlockDecodeContext::new(ifd, layout, byte_order)?;
+
+    let row_bytes = layout.checked_packed_row_bytes()?;
+    let output_len = checked_layout_mul(window.rows, row_bytes, "packed window output length")?;
+    let mut output = allocate_decode_output(output_len, options.decode_output_bytes)?;
+
+    let relevant_specs = collect_strip_specs_for_window(ifd, &layout, window, None)?;
+
+    #[cfg(feature = "rayon")]
+    {
+        let output = Mutex::new(output.as_mut_slice());
+        relevant_specs.par_iter().try_for_each(|&spec| {
+            let (block, block_spec) = read_strip_block_for_window(
+                source, ifd_offset, cache, spec, &context, window, options, true,
+            )?;
+            copy_strip_packed_window_block(&mut output.lock(), block.as_slice(), block_spec, row_bytes, window)?;
+            Ok::<(), Error>(())
+        })?;
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    for spec in relevant_specs {
+        let (block, block_spec) = read_strip_block_for_window(
+            source, ifd_offset, cache, spec, &context, window, options, true,
+        )?;
+        copy_strip_packed_window_block(&mut output, block.as_slice(), block_spec, row_bytes, window)?;
     }
 
     Ok(output)
@@ -102,7 +157,7 @@ pub(crate) fn read_window_band(
         let output = Mutex::new(output.as_mut_slice());
         relevant_specs.par_iter().try_for_each(|&spec| {
             let (block, block_spec) = read_strip_block_for_window(
-                source, ifd_offset, cache, spec, &context, window, options,
+                source, ifd_offset, cache, spec, &context, window, options, false,
             )?;
             copy_strip_band_window_block(
                 &mut output.lock(),
@@ -119,7 +174,7 @@ pub(crate) fn read_window_band(
     #[cfg(not(feature = "rayon"))]
     for spec in relevant_specs {
         let (block, block_spec) = read_strip_block_for_window(
-            source, ifd_offset, cache, spec, &context, window, options,
+            source, ifd_offset, cache, spec, &context, window, options, false,
         )?;
         copy_strip_band_window_block(
             &mut output,
@@ -132,6 +187,97 @@ pub(crate) fn read_window_band(
     }
 
     Ok(output)
+}
+
+/// Read one band's full-width sub-byte window as raw **packed** on-disk
+/// sample-plane rows, verbatim (unpack skipped, padding preserved).
+///
+/// Only valid for planar (`PlanarConfiguration=2`) sub-byte storage with a
+/// full-width window; each plane is a contiguous packed region on disk, so the
+/// packed rows copy out verbatim. The caller
+/// ([`decode_window_packed_band_bytes`](crate::TiffFile::read_band_packed_bytes))
+/// enforces that and routes chunky (bit-interleaved) bands through the re-pack
+/// path, where extracting one band cannot be a verbatim copy of an on-disk range.
+pub(crate) fn read_window_band_packed(
+    source: &dyn TiffSource,
+    ifd: &Ifd,
+    byte_order: ByteOrder,
+    cache: &BlockCache,
+    window: Window,
+    band_index: usize,
+    options: DecodeReadOptions<'_>,
+) -> Result<Vec<u8>> {
+    let layout = ifd.raster_layout()?;
+    if band_index >= layout.samples_per_pixel {
+        return Err(Error::BandIndexOutOfBounds {
+            index: band_index,
+            band_count: layout.samples_per_pixel,
+        });
+    }
+    if window.is_empty() {
+        return Ok(Vec::new());
+    }
+    debug_assert_eq!(layout.planar_configuration, 2);
+    debug_assert!(window.col_off == 0 && window.cols == layout.width);
+    let ifd_offset = ifd.offset();
+    let context = block_decode::BlockDecodeContext::new(ifd, layout, byte_order)?;
+
+    let row_bytes = layout.checked_packed_sample_plane_row_bytes()?;
+    let output_len = checked_layout_mul(window.rows, row_bytes, "packed band output length")?;
+    let mut output = allocate_decode_output(output_len, options.decode_output_bytes)?;
+
+    let relevant_specs = collect_strip_specs_for_window(ifd, &layout, window, Some(band_index))?;
+
+    #[cfg(feature = "rayon")]
+    {
+        let output = Mutex::new(output.as_mut_slice());
+        relevant_specs.par_iter().try_for_each(|&spec| {
+            let (block, block_spec) = read_strip_block_for_window(
+                source, ifd_offset, cache, spec, &context, window, options, true,
+            )?;
+            copy_strip_packed_window_block(&mut output.lock(), block.as_slice(), block_spec, row_bytes, window)?;
+            Ok::<(), Error>(())
+        })?;
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    for spec in relevant_specs {
+        let (block, block_spec) = read_strip_block_for_window(
+            source, ifd_offset, cache, spec, &context, window, options, true,
+        )?;
+        copy_strip_packed_window_block(&mut output, block.as_slice(), block_spec, row_bytes, window)?;
+    }
+
+    Ok(output)
+}
+
+/// Copy whole packed rows for the window's row range out of a decoded packed
+/// block. Full-width only: each raster row is exactly `row_bytes` on disk and
+/// in the output, so the copy is a contiguous whole-row memcpy with no column
+/// slicing or bit re-interleave (that is what keeps the padding bits verbatim).
+fn copy_strip_packed_window_block(
+    output: &mut [u8],
+    block: &[u8],
+    spec: StripBlockSpec,
+    row_bytes: usize,
+    window: Window,
+) -> Result<()> {
+    let block_row_end = checked_layout_add(spec.row_start, spec.rows_in_strip, "strip row range")?;
+    let copy_row_start = spec.row_start.max(window.row_off);
+    let copy_row_end = block_row_end.min(window.row_end());
+    for row in copy_row_start..copy_row_end {
+        let src_row_index = row - spec.row_start;
+        let dest_row_index = row - window.row_off;
+        let src_offset =
+            checked_layout_mul(src_row_index, row_bytes, "packed strip source row offset")?;
+        let dest_offset =
+            checked_layout_mul(dest_row_index, row_bytes, "packed strip output row offset")?;
+        let src_end = checked_layout_add(src_offset, row_bytes, "packed strip source row range")?;
+        let dest_end =
+            checked_layout_add(dest_offset, row_bytes, "packed strip output row range")?;
+        output[dest_offset..dest_end].copy_from_slice(&block[src_offset..src_end]);
+    }
+    Ok(())
 }
 
 fn copy_strip_window_block(
@@ -413,6 +559,7 @@ fn read_strip_block(
     spec: StripBlockSpec,
     context: &block_decode::BlockDecodeContext<'_>,
     options: DecodeReadOptions<'_>,
+    packed: bool,
 ) -> Result<Arc<Vec<u8>>> {
     let decode_request = block_decode::BlockDecodeRequest {
         context,
@@ -420,6 +567,7 @@ fn read_strip_block(
         index: spec.index,
         block_width: context.layout.width,
         block_height: spec.rows_in_strip,
+        packed,
     };
     let decoded_len = block_decode::decoded_block_len(&decode_request)?;
     validate_decode_output_len(decoded_len, options.decode_output_bytes)?;
@@ -428,6 +576,7 @@ fn read_strip_block(
         ifd_offset,
         kind: BlockKind::Strip,
         block_index: spec.index,
+        packed,
     };
     if let Some(cached) = cache.get(&cache_key) {
         return Ok(cached);
@@ -466,6 +615,7 @@ fn read_strip_block(
         index: spec.index,
         block_width: context.layout.width,
         block_height: spec.rows_in_strip,
+        packed,
     })?;
     Ok(cache.insert(cache_key, decoded))
 }
@@ -479,6 +629,7 @@ fn read_strip_block(
 /// rows those bytes actually cover -- callers must use the returned spec
 /// (not the original) when copying rows out of the block, since a bounded
 /// read's block only contains `window`'s rows, not the full strip.
+#[allow(clippy::too_many_arguments)]
 fn read_strip_block_for_window(
     source: &dyn TiffSource,
     ifd_offset: u64,
@@ -487,11 +638,13 @@ fn read_strip_block_for_window(
     context: &block_decode::BlockDecodeContext<'_>,
     window: Window,
     options: DecodeReadOptions<'_>,
+    packed: bool,
 ) -> Result<(Arc<Vec<u8>>, StripBlockSpec)> {
-    if let Some(bounded) = read_strip_block_bounded(source, spec, context, window, options)? {
+    if let Some(bounded) = read_strip_block_bounded(source, spec, context, window, options, packed)?
+    {
         return Ok(bounded);
     }
-    let block = read_strip_block(source, ifd_offset, cache, spec, context, options)?;
+    let block = read_strip_block(source, ifd_offset, cache, spec, context, options, packed)?;
     Ok((block, spec))
 }
 
@@ -524,6 +677,7 @@ fn read_strip_block_bounded(
     context: &block_decode::BlockDecodeContext<'_>,
     window: Window,
     options: DecodeReadOptions<'_>,
+    packed: bool,
 ) -> Result<Option<(Arc<Vec<u8>>, StripBlockSpec)>> {
     // GDAL-wrapped blocks carry a size-prefix/trailer around the payload;
     // a linear row-range seek would land inside that framing, not at a row
@@ -553,6 +707,7 @@ fn read_strip_block_bounded(
         index: spec.index,
         block_width: layout.width,
         block_height: spec.rows_in_strip,
+        packed,
     };
     let full_byte_count_limit =
         block_decode::compressed_block_byte_count_limit(&full_decode_request)?;
@@ -609,6 +764,7 @@ fn read_strip_block_bounded(
         index: spec.index,
         block_width: layout.width,
         block_height: clip_rows,
+        packed,
     };
     let decoded_len = block_decode::decoded_block_len(&decode_request)?;
     validate_decode_output_len(decoded_len, options.decode_output_bytes)?;
@@ -642,6 +798,7 @@ fn read_strip_block_bounded(
         index: spec.index,
         block_width: layout.width,
         block_height: clip_rows,
+        packed,
     })?;
 
     Ok(Some((Arc::new(decoded), clipped_spec)))

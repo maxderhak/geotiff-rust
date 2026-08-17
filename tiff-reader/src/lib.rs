@@ -882,10 +882,15 @@ impl TiffFile {
 
     /// Decode a window into interleaved packed storage bytes.
     ///
-    /// Reuses the bounded/windowed unpacked decode, then re-packs sub-byte
-    /// samples MSB-first (the exact inverse of the reader's sub-byte unpack).
-    /// For byte-aligned depths the unpacked storage bytes are already packed
-    /// and are returned unchanged.
+    /// For a **full-width sub-byte chunky** window this decodes the strips and
+    /// returns the packed rows **verbatim** (the sub-byte unpack and per-sample
+    /// re-interleave are skipped), so the on-disk trailing padding bits survive
+    /// byte-exact. Every other sub-byte shape (a column sub-window, or tiled
+    /// storage whose per-tile packing does not align to a full-width row) reuses
+    /// the bounded/windowed unpacked decode and re-packs sub-byte samples
+    /// MSB-first (the exact inverse of the reader's sub-byte unpack); a re-pack
+    /// starts fresh at bit 0, so its trailing padding is zero. For byte-aligned
+    /// depths the unpacked storage bytes are already packed and returned unchanged.
     fn decode_window_packed_bytes(&self, ifd: &Ifd, window: Window) -> Result<Vec<u8>> {
         if window.is_empty() {
             return Ok(Vec::new());
@@ -904,6 +909,25 @@ impl TiffFile {
                  read_band_window_packed_bytes)",
                 layout.planar_configuration
             )));
+        }
+        // Verbatim fast path: a full-width sub-byte chunky window is exactly the
+        // decompressed packed rows on disk, so copy them out without the
+        // unpack->repack round-trip (which would zero the padding bits). Only
+        // strips have full-width packed rows; a sub-byte tile packs to its own
+        // padded tile_width, so tiled storage falls through to the repack path.
+        if layout.bits_per_sample < 8
+            && !ifd.is_tiled()
+            && window.col_off == 0
+            && window.cols == layout.width
+        {
+            return strip::read_window_packed(
+                self.source.as_ref(),
+                ifd,
+                self.byte_order(),
+                &self.block_cache,
+                window,
+                self.decode_read_options(),
+            );
         }
         let unpacked = self.decode_window_sample_bytes(ifd, window)?;
         if layout.bits_per_sample >= 8 {
@@ -925,8 +949,12 @@ impl TiffFile {
     /// Decode a window from one band into packed sample-plane bytes.
     ///
     /// See [`decode_window_packed_bytes`](Self::decode_window_packed_bytes).
-    /// Sub-byte bands re-pack `window.cols` samples per row into
-    /// `ceil(cols * bits / 8)` MSB-first bytes.
+    /// A **full-width sub-byte planar** (`PlanarConfiguration=2`) band is a
+    /// contiguous packed region on disk, so its packed sample-plane rows are
+    /// returned verbatim (unpack skipped, padding preserved). Otherwise (a
+    /// chunky/bit-interleaved band, a column sub-window, or tiled storage) the
+    /// band is decoded and its `window.cols` samples per row are re-packed into
+    /// `ceil(cols * bits / 8)` MSB-first bytes (padding zeroed).
     fn decode_window_packed_band_bytes(
         &self,
         ifd: &Ifd,
@@ -937,6 +965,27 @@ impl TiffFile {
             return Ok(Vec::new());
         }
         let layout = ifd.raster_layout()?;
+        // Verbatim fast path: a full-width sub-byte planar band is stored as a
+        // contiguous per-plane packed region, so copy its packed rows out
+        // without the unpack->repack round-trip. A chunky sub-byte band is
+        // bit-interleaved with the other bands, so extracting one band can never
+        // be a verbatim copy of an on-disk range -- it stays on the repack path.
+        if layout.bits_per_sample < 8
+            && layout.planar_configuration == 2
+            && !ifd.is_tiled()
+            && window.col_off == 0
+            && window.cols == layout.width
+        {
+            return strip::read_window_band_packed(
+                self.source.as_ref(),
+                ifd,
+                self.byte_order(),
+                &self.block_cache,
+                window,
+                band_index,
+                self.decode_read_options(),
+            );
+        }
         let unpacked = self.decode_window_sample_band_bytes(ifd, window, band_index)?;
         if layout.bits_per_sample >= 8 {
             return Ok(unpacked);

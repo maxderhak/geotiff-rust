@@ -482,6 +482,7 @@ fn read_tile_block(
         index: spec.index,
         block_width: spec.tile_width,
         block_height: spec.tile_height,
+        packed: false,
     };
     let decoded_len = block_decode::decoded_block_len(&decode_request)?;
     validate_decode_output_len(decoded_len, options.decode_output_bytes)?;
@@ -490,6 +491,7 @@ fn read_tile_block(
         ifd_offset,
         kind: BlockKind::Tile,
         block_index: spec.index,
+        packed: false,
     };
     if let Some(cached) = cache.get(&cache_key) {
         return Ok(cached);
@@ -528,6 +530,7 @@ fn read_tile_block(
         index: spec.index,
         block_width: spec.tile_width,
         block_height: spec.tile_height,
+        packed: false,
     })?;
     Ok(cache.insert(cache_key, decoded))
 }

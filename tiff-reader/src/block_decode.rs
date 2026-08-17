@@ -74,6 +74,13 @@ pub(crate) struct BlockDecodeRequest<'a> {
     pub index: usize,
     pub block_width: usize,
     pub block_height: usize,
+    /// Return sub-byte (1/2/4-bit) samples in their raw packed, MSB-first
+    /// on-disk representation rather than unpacked to one byte per sample.
+    /// The block is still decompressed and endianness/predictor-corrected;
+    /// only the final `unpack_subbyte_block` step is skipped, so the packed
+    /// rows (trailing padding bits included) are returned verbatim. Ignored
+    /// for byte-aligned depths, whose storage bytes are already "packed".
+    pub packed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -172,7 +179,7 @@ pub(crate) fn decode_compressed_block(request: BlockDecodeRequest<'_>) -> Result
                 request.block_height,
                 *subsampling,
             )?;
-        } else if request.context.layout.bits_per_sample < 8 {
+        } else if request.context.layout.bits_per_sample < 8 && !request.packed {
             decoded = unpack_subbyte_block(
                 &decoded,
                 request.context.layout.bits_per_sample,
@@ -182,6 +189,9 @@ pub(crate) fn decode_compressed_block(request: BlockDecodeRequest<'_>) -> Result
                 request.index,
             )?;
         }
+        // When `request.packed`, sub-byte samples are left in their packed,
+        // endianness/predictor-corrected on-disk representation (the input to
+        // `unpack_subbyte_block`), so the trailing padding bits survive verbatim.
         return Ok(decoded);
     }
 
@@ -206,6 +216,11 @@ pub(crate) fn decoded_block_len(request: &BlockDecodeRequest<'_>) -> Result<usiz
             });
     }
     if request.context.layout.bits_per_sample < 8 {
+        // A packed decode keeps the on-disk packed row bytes (the encoded
+        // length); only an unpacking decode expands to one byte per sample.
+        if request.packed {
+            return expected_encoded_block_len(request, samples);
+        }
         return request
             .block_width
             .checked_mul(samples)

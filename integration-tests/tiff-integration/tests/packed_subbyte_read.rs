@@ -13,6 +13,192 @@ use tiff_core::PlanarConfiguration;
 use tiff_reader::TiffFile;
 use tiff_writer::{ImageBuilder, TiffWriter, WriteOptions};
 
+/// Set the trailing padding bits (the bits in each packed row beyond the
+/// `data_bits` real sample bits) to 1 for every packed row in every strip of
+/// the encoded TIFF `buf`, so the on-disk bytes carry NON-ZERO padding.
+///
+/// The fork writer always zero-pads, so this is the only way to author an
+/// on-disk image whose padding differs from a fresh MSB-first re-pack. It lets
+/// the verbatim-read tests prove the packed accessors copy the on-disk bytes
+/// literally (padding included) rather than re-packing (which zero-fills).
+///
+/// `data_bits` is the number of real sample bits per packed row:
+/// `width * samples_per_pixel * bits` for chunky, `width * bits` per
+/// sample-plane row for planar.
+fn set_trailing_padding_bits(buf: &mut [u8], row_bytes: usize, data_bits: usize) {
+    let file = TiffFile::from_bytes(buf.to_vec()).unwrap();
+    let ifd = file.ifd(0).unwrap();
+    let offsets = ifd.strip_offsets().unwrap();
+    let counts = ifd.strip_byte_counts().unwrap();
+    drop(file);
+
+    let pad = row_bytes * 8 - data_bits;
+    assert!(pad > 0, "test image must have real trailing padding bits");
+    assert!(pad < 8, "padding must live in a single trailing byte");
+    let pad_mask = ((1u16 << pad) - 1) as u8;
+
+    for (&offset, &count) in offsets.iter().zip(counts.iter()) {
+        let offset = offset as usize;
+        let count = count as usize;
+        assert_eq!(count % row_bytes, 0, "strip must be a whole number of rows");
+        let rows = count / row_bytes;
+        for r in 0..rows {
+            let last = offset + r * row_bytes + (row_bytes - 1);
+            buf[last] |= pad_mask;
+        }
+    }
+}
+
+/// Concatenate the on-disk packed bytes of every strip in encoding order —
+/// the exact bytes a verbatim full-width packed read must reproduce.
+fn ondisk_strip_bytes(buf: &[u8]) -> Vec<u8> {
+    let file = TiffFile::from_bytes(buf.to_vec()).unwrap();
+    let ifd = file.ifd(0).unwrap();
+    let offsets = ifd.strip_offsets().unwrap();
+    let counts = ifd.strip_byte_counts().unwrap();
+    let mut out = Vec::new();
+    for (&offset, &count) in offsets.iter().zip(counts.iter()) {
+        out.extend_from_slice(&buf[offset as usize..offset as usize + count as usize]);
+    }
+    out
+}
+
+/// The exact bytes of one band's (plane's) strips in encoding order.
+fn ondisk_plane_bytes(buf: &[u8], plane: usize, strips_per_plane: usize) -> Vec<u8> {
+    let file = TiffFile::from_bytes(buf.to_vec()).unwrap();
+    let ifd = file.ifd(0).unwrap();
+    let offsets = ifd.strip_offsets().unwrap();
+    let counts = ifd.strip_byte_counts().unwrap();
+    let mut out = Vec::new();
+    for i in 0..strips_per_plane {
+        let strip = plane * strips_per_plane + i;
+        out.extend_from_slice(
+            &buf[offsets[strip] as usize..offsets[strip] as usize + counts[strip] as usize],
+        );
+    }
+    out
+}
+
+/// VERBATIM: a full-width sub-byte chunky read returns the on-disk packed
+/// bytes exactly, INCLUDING non-zero trailing padding — proving the read
+/// copies packed rows verbatim instead of unpack→repack (which zero-fills
+/// padding). Exercises both the single-giant-strip (bounded) path and the
+/// multi-strip (cached) path, and confirms the unpacked decode is unchanged.
+#[test]
+fn chunky_1bit_full_width_packed_read_is_verbatim_with_nonzero_padding() {
+    // 9 columns: each row packs to ceil(9/8) = 2 bytes = 16 bits, 9 data + 7 padding.
+    let width: u32 = 9;
+    let height: u32 = 4;
+    let values: Vec<u8> = (0..(width * height))
+        .map(|i| (i % 2) as u8)
+        .collect::<Vec<_>>();
+    let row_bytes = 2usize;
+    let data_bits = width as usize; // 1 bit/sample, 1 channel
+
+    for rows_per_strip in [height, 1] {
+        let mut buf = Cursor::new(Vec::new());
+        let mut writer = TiffWriter::new(&mut buf, WriteOptions::default()).unwrap();
+        let image = ImageBuilder::new(width, height)
+            .bits_per_sample(1)
+            .strips(rows_per_strip);
+        let handle = writer.add_image(image).unwrap();
+        let rows_per_block = rows_per_strip as usize;
+        let blocks = (height as usize).div_ceil(rows_per_block);
+        for block in 0..blocks {
+            let start = block * rows_per_block * width as usize;
+            let end = ((block + 1) * rows_per_block * width as usize).min(values.len());
+            writer.write_block(&handle, block, &values[start..end]).unwrap();
+        }
+        writer.finish().unwrap();
+        let mut bytes = buf.into_inner();
+
+        // Author non-zero on-disk padding.
+        set_trailing_padding_bits(&mut bytes, row_bytes, data_bits);
+        let expected = ondisk_strip_bytes(&bytes);
+
+        let file = TiffFile::from_bytes(bytes).unwrap();
+
+        // Unpacked decode must be UNCHANGED (padding bits are ignored).
+        let unpacked = file
+            .read_window_bytes(0, 0, 0, height as usize, width as usize)
+            .unwrap();
+        assert_eq!(
+            unpacked, values,
+            "rows_per_strip={rows_per_strip}: unpacked decode must ignore padding bits"
+        );
+
+        // Packed read must be VERBATIM to disk (padding included).
+        let packed = file
+            .read_window_packed_bytes(0, 0, 0, height as usize, width as usize)
+            .unwrap();
+        assert_eq!(
+            packed, expected,
+            "rows_per_strip={rows_per_strip}: full-width packed read must be verbatim on-disk bytes incl. padding"
+        );
+        assert_eq!(packed.len(), row_bytes * height as usize);
+    }
+}
+
+/// VERBATIM per-band planar read: each plane's full-width sub-byte packed read
+/// returns that plane's on-disk bytes exactly, including non-zero padding.
+#[test]
+fn planar_2bit_per_band_packed_read_is_verbatim_with_nonzero_padding() {
+    // width=5, 2 bits/sample: each sample-plane row packs to ceil(5*2/8)=2 bytes
+    // = 16 bits, 10 data + 6 padding.
+    let width: u32 = 5;
+    let height: u32 = 2;
+    let spp: u16 = 2;
+    let row_bytes = 2usize;
+    let data_bits = width as usize * 2; // 2 bits/sample, single plane
+
+    let band_rows: [[[u8; 5]; 2]; 2] = [
+        [[0, 1, 2, 3, 0], [3, 2, 1, 0, 1]],
+        [[1, 0, 3, 2, 1], [2, 1, 0, 3, 2]],
+    ];
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut writer = TiffWriter::new(&mut buf, WriteOptions::default()).unwrap();
+    let image = ImageBuilder::new(width, height)
+        .bits_per_sample(2)
+        .samples_per_pixel(spp)
+        .planar_configuration(PlanarConfiguration::Planar)
+        .strips(height); // one strip per plane
+    let handle = writer.add_image(image).unwrap();
+    for (band, rows) in band_rows.iter().enumerate() {
+        let flat: Vec<u8> = rows.iter().flatten().copied().collect();
+        writer.write_block(&handle, band, &flat).unwrap();
+    }
+    writer.finish().unwrap();
+    let mut bytes = buf.into_inner();
+
+    set_trailing_padding_bits(&mut bytes, row_bytes, data_bits);
+
+    let file = TiffFile::from_bytes(bytes.clone()).unwrap();
+    let ifd = file.ifd(0).unwrap();
+    assert_eq!(ifd.strip_offsets().unwrap().len(), spp as usize);
+    drop(file);
+
+    let file = TiffFile::from_bytes(bytes.clone()).unwrap();
+    for (band, rows) in band_rows.iter().enumerate() {
+        let expected = ondisk_plane_bytes(&bytes, band, 1);
+        let packed = file
+            .read_band_window_packed_bytes(0, band, 0, 0, height as usize, width as usize)
+            .unwrap();
+        assert_eq!(
+            packed, expected,
+            "band {band} full-width packed read must be verbatim on-disk plane bytes incl. padding"
+        );
+        assert_eq!(packed.len(), row_bytes * height as usize);
+
+        // Unpacked band decode unchanged.
+        let flat: Vec<u8> = rows.iter().flatten().copied().collect();
+        let unpacked = file
+            .read_band_window_bytes(0, band, 0, 0, height as usize, width as usize)
+            .unwrap();
+        assert_eq!(unpacked, flat, "band {band}: unpacked decode must ignore padding");
+    }
+}
+
 /// Canonical MSB-first packing of `samples_per_row` samples per row into
 /// `ceil(samples_per_row*bits/8)` bytes, matching the TIFF sub-byte storage
 /// convention. `bits` must be 1, 2, or 4 (so no sample straddles a byte).

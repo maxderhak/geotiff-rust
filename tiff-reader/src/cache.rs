@@ -18,6 +18,12 @@ pub struct BlockKey {
     pub ifd_offset: u64,
     pub kind: BlockKind,
     pub block_index: usize,
+    /// Whether the cached bytes are the raw packed sub-byte representation
+    /// (verbatim on-disk rows, unpack skipped) rather than the default
+    /// one-byte-per-sample unpacked decode. Packed and unpacked decodes of the
+    /// same block have distinct representations, so they must not collide in
+    /// the cache under the same key.
+    pub packed: bool,
 }
 
 /// Whether the cached block came from a strip- or tile-backed image.
@@ -108,16 +114,19 @@ mod tests {
             ifd_offset: 0,
             kind: BlockKind::Strip,
             block_index: 0,
+            packed: false,
         };
         let b = BlockKey {
             ifd_offset: 0,
             kind: BlockKind::Strip,
             block_index: 1,
+            packed: false,
         };
         let c = BlockKey {
             ifd_offset: 0,
             kind: BlockKind::Strip,
             block_index: 2,
+            packed: false,
         };
 
         cache.insert(a, vec![0; 4]);
@@ -128,6 +137,7 @@ mod tests {
             ifd_offset: 0,
             kind: BlockKind::Strip,
             block_index: 0,
+            packed: false,
         };
         assert!(cache.get(&promoted).is_some());
 
@@ -135,6 +145,7 @@ mod tests {
             ifd_offset: 0,
             kind: BlockKind::Strip,
             block_index: 3,
+            packed: false,
         };
         cache.insert(d, vec![0; 4]);
 
@@ -142,6 +153,7 @@ mod tests {
             ifd_offset: 0,
             kind: BlockKind::Strip,
             block_index: 1,
+            packed: false,
         };
         assert!(cache.get(&promoted).is_some());
         assert!(cache.get(&evicted).is_none());
@@ -154,6 +166,7 @@ mod tests {
             ifd_offset: 0,
             kind: BlockKind::Tile,
             block_index: 0,
+            packed: false,
         };
         cache.insert(key, vec![1, 2, 3]);
         assert!(cache.get(&key).is_none());
@@ -166,6 +179,7 @@ mod tests {
             ifd_offset: 0,
             kind: BlockKind::Tile,
             block_index: 0,
+            packed: false,
         };
         cache.insert(key, vec![1, 2, 3]);
         assert!(cache.get(&key).is_none());
@@ -181,6 +195,7 @@ mod tests {
                     ifd_offset: 0,
                     kind: BlockKind::Strip,
                     block_index,
+                    packed: false,
                 },
                 vec![0; 4],
             );
@@ -196,11 +211,13 @@ mod tests {
             ifd_offset: 0,
             kind: BlockKind::Tile,
             block_index: 0,
+            packed: false,
         };
         let b = BlockKey {
             ifd_offset: 0,
             kind: BlockKind::Tile,
             block_index: 1,
+            packed: false,
         };
 
         cache.insert(a, vec![0; 8]);
@@ -221,6 +238,7 @@ mod tests {
             ifd_offset: 0,
             kind: BlockKind::Tile,
             block_index: 0,
+            packed: false,
         };
 
         cache.insert(key, vec![0; 4]);
