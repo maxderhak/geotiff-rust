@@ -678,6 +678,126 @@ impl TiffFile {
         self.decode_window_sample_band_bytes(ifd, window, band_index)
     }
 
+    /// Decode an image into raw on-disk **packed** storage bytes.
+    ///
+    /// Identical to [`read_image_bytes`](Self::read_image_bytes) except that
+    /// sub-byte samples (1/2/4 bits) are returned in their packed, MSB-first
+    /// on-disk representation (`ceil(width * samples_per_pixel * bits / 8)`
+    /// bytes per row) rather than expanded to one byte per sample. For
+    /// byte-aligned depths (8/16/32/64 bits) the packed bytes are identical to
+    /// the unpacked storage bytes, so callers can use one path for all depths.
+    ///
+    /// Compression is still decompressed; only the sub-byte bit-unpack is
+    /// skipped. The read stays bounded to the strips/tiles the image occupies.
+    pub fn read_image_packed_bytes(&self, ifd_index: usize) -> Result<Vec<u8>> {
+        let ifd = self.ifd(ifd_index)?;
+        self.read_image_packed_bytes_from_ifd(ifd)
+    }
+
+    /// Decode an arbitrary IFD into raw on-disk **packed** storage bytes.
+    pub fn read_image_packed_bytes_from_ifd(&self, ifd: &Ifd) -> Result<Vec<u8>> {
+        let layout = ifd.raster_layout()?;
+        self.decode_window_packed_bytes(
+            ifd,
+            Window {
+                row_off: 0,
+                col_off: 0,
+                rows: layout.height,
+                cols: layout.width,
+            },
+        )
+    }
+
+    /// Decode a pixel window into raw on-disk **packed** storage bytes.
+    ///
+    /// See [`read_image_packed_bytes`](Self::read_image_packed_bytes) for the
+    /// packed-vs-unpacked contract. Sub-byte rows are packed as
+    /// `ceil(cols * samples_per_pixel * bits / 8)` MSB-first bytes; a
+    /// full-width window (`col_off == 0`, `cols == width`) reproduces the
+    /// exact on-disk bytes.
+    pub fn read_window_packed_bytes(
+        &self,
+        ifd_index: usize,
+        row_off: usize,
+        col_off: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<u8>> {
+        let ifd = self.ifd(ifd_index)?;
+        self.read_window_packed_bytes_from_ifd(ifd, row_off, col_off, rows, cols)
+    }
+
+    /// Decode a pixel window from an arbitrary IFD into raw on-disk **packed**
+    /// storage bytes.
+    pub fn read_window_packed_bytes_from_ifd(
+        &self,
+        ifd: &Ifd,
+        row_off: usize,
+        col_off: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<u8>> {
+        let layout = ifd.raster_layout()?;
+        let window = validate_window(&layout, row_off, col_off, rows, cols)?;
+        self.decode_window_packed_bytes(ifd, window)
+    }
+
+    /// Decode a single storage-domain band into raw on-disk **packed** bytes.
+    ///
+    /// Sub-byte bands are packed as `ceil(cols * bits / 8)` MSB-first bytes per
+    /// sample-plane row (the per-plane on-disk layout for planar images); a
+    /// full-width read reproduces that plane's exact on-disk bytes.
+    pub fn read_band_packed_bytes(&self, ifd_index: usize, band_index: usize) -> Result<Vec<u8>> {
+        let ifd = self.ifd(ifd_index)?;
+        self.read_band_packed_bytes_from_ifd(ifd, band_index)
+    }
+
+    /// Decode a single storage-domain band from an arbitrary IFD into raw
+    /// on-disk **packed** bytes.
+    pub fn read_band_packed_bytes_from_ifd(&self, ifd: &Ifd, band_index: usize) -> Result<Vec<u8>> {
+        let layout = ifd.raster_layout()?;
+        self.read_band_window_packed_bytes_from_ifd(
+            ifd,
+            band_index,
+            0,
+            0,
+            layout.height,
+            layout.width,
+        )
+    }
+
+    /// Decode a pixel window from one storage-domain band into raw on-disk
+    /// **packed** bytes.
+    pub fn read_band_window_packed_bytes(
+        &self,
+        ifd_index: usize,
+        band_index: usize,
+        row_off: usize,
+        col_off: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<u8>> {
+        let ifd = self.ifd(ifd_index)?;
+        self.read_band_window_packed_bytes_from_ifd(ifd, band_index, row_off, col_off, rows, cols)
+    }
+
+    /// Decode a pixel window from one storage-domain band in an arbitrary IFD
+    /// into raw on-disk **packed** bytes.
+    pub fn read_band_window_packed_bytes_from_ifd(
+        &self,
+        ifd: &Ifd,
+        band_index: usize,
+        row_off: usize,
+        col_off: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<u8>> {
+        let layout = ifd.raster_layout()?;
+        validate_band_index(&layout, band_index)?;
+        let window = validate_window(&layout, row_off, col_off, rows, cols)?;
+        self.decode_window_packed_band_bytes(ifd, window, band_index)
+    }
+
     fn decode_window_sample_bytes(&self, ifd: &Ifd, window: Window) -> Result<Vec<u8>> {
         if window.is_empty() {
             return Ok(Vec::new());
@@ -737,6 +857,56 @@ impl TiffFile {
                 self.decode_read_options(),
             )
         }
+    }
+
+    /// Decode a window into interleaved packed storage bytes.
+    ///
+    /// Reuses the bounded/windowed unpacked decode, then re-packs sub-byte
+    /// samples MSB-first (the exact inverse of the reader's sub-byte unpack).
+    /// For byte-aligned depths the unpacked storage bytes are already packed
+    /// and are returned unchanged.
+    fn decode_window_packed_bytes(&self, ifd: &Ifd, window: Window) -> Result<Vec<u8>> {
+        if window.is_empty() {
+            return Ok(Vec::new());
+        }
+        let layout = ifd.raster_layout()?;
+        let unpacked = self.decode_window_sample_bytes(ifd, window)?;
+        if layout.bits_per_sample >= 8 {
+            return Ok(unpacked);
+        }
+        let samples_per_row = checked_layout_mul(
+            window.cols,
+            layout.samples_per_pixel,
+            "packed window row sample count",
+        )?;
+        repack_subbyte_msb_first(
+            &unpacked,
+            samples_per_row,
+            window.rows,
+            layout.bits_per_sample,
+        )
+    }
+
+    /// Decode a window from one band into packed sample-plane bytes.
+    ///
+    /// See [`decode_window_packed_bytes`](Self::decode_window_packed_bytes).
+    /// Sub-byte bands re-pack `window.cols` samples per row into
+    /// `ceil(cols * bits / 8)` MSB-first bytes.
+    fn decode_window_packed_band_bytes(
+        &self,
+        ifd: &Ifd,
+        window: Window,
+        band_index: usize,
+    ) -> Result<Vec<u8>> {
+        if window.is_empty() {
+            return Ok(Vec::new());
+        }
+        let layout = ifd.raster_layout()?;
+        let unpacked = self.decode_window_sample_band_bytes(ifd, window, band_index)?;
+        if layout.bits_per_sample >= 8 {
+            return Ok(unpacked);
+        }
+        repack_subbyte_msb_first(&unpacked, window.cols, window.rows, layout.bits_per_sample)
     }
 
     fn decode_window_pixel_bytes(&self, ifd: &Ifd, window: Window) -> Result<Vec<u8>> {
@@ -999,6 +1169,55 @@ fn validate_window(
     })
 }
 
+/// Re-pack one-byte-per-sample values into MSB-first sub-byte storage bytes.
+///
+/// This is the exact inverse of the reader's sub-byte unpack
+/// (`block_decode::unpack_subbyte_block`): each row of `samples_per_row`
+/// samples is packed into `ceil(samples_per_row * bits / 8)` bytes, samples
+/// filling each byte most-significant-bits first, trailing bits zero-padded.
+/// `bits` is always 1, 2, or 4 here (the only sub-byte depths the reader
+/// unpacks), so no sample straddles a byte boundary.
+fn repack_subbyte_msb_first(
+    unpacked: &[u8],
+    samples_per_row: usize,
+    rows: usize,
+    bits: u16,
+) -> Result<Vec<u8>> {
+    debug_assert!(matches!(bits, 1 | 2 | 4));
+    let bits = bits as usize;
+    let expected_samples = samples_per_row
+        .checked_mul(rows)
+        .ok_or_else(|| Error::InvalidImageLayout("packed sample count overflows usize".into()))?;
+    if unpacked.len() != expected_samples {
+        return Err(Error::InvalidImageLayout(format!(
+            "packed re-pack expected {expected_samples} samples but received {}",
+            unpacked.len()
+        )));
+    }
+    let row_bytes = samples_per_row
+        .checked_mul(bits)
+        .map(|total_bits| total_bits.div_ceil(8))
+        .ok_or_else(|| Error::InvalidImageLayout("packed row byte count overflows usize".into()))?;
+    let output_len = row_bytes
+        .checked_mul(rows)
+        .ok_or_else(|| Error::InvalidImageLayout("packed output size overflows usize".into()))?;
+
+    let mask = ((1u16 << bits) - 1) as u8;
+    let samples_per_byte = 8 / bits;
+    let mut output = vec![0u8; output_len];
+    for row in 0..rows {
+        let src = &unpacked[row * samples_per_row..(row + 1) * samples_per_row];
+        let dst = &mut output[row * row_bytes..(row + 1) * row_bytes];
+        for (sample_index, &sample) in src.iter().enumerate() {
+            let byte_index = sample_index / samples_per_byte;
+            let within_byte = sample_index % samples_per_byte;
+            let shift = 8 - bits * (within_byte + 1);
+            dst[byte_index] |= (sample & mask) << shift;
+        }
+    }
+    Ok(output)
+}
+
 fn validate_band_index(layout: &RasterLayout, band_index: usize) -> Result<()> {
     if band_index >= layout.samples_per_pixel {
         return Err(Error::BandIndexOutOfBounds {
@@ -1196,6 +1415,42 @@ mod tests {
             data.push(pixel);
         }
         data
+    }
+
+    #[test]
+    fn repack_subbyte_is_inverse_of_unpack_msb_first() {
+        // 2-bit, 5 samples/row, 2 rows: last byte of each row has 1 sample + pad.
+        let unpacked = vec![
+            0u8, 1, 2, 3, 0, /* row0 */ 3, 2, 1, 0, 1, /* row1 */
+        ];
+        let packed = super::repack_subbyte_msb_first(&unpacked, 5, 2, 2).unwrap();
+        // ceil(5*2/8) = 2 bytes per row.
+        assert_eq!(packed.len(), 4);
+        // Row 0: samples 0,1,2,3 -> 0b00_01_10_11 = 0x1B; sample 0 -> 0b00_000000 = 0x00.
+        assert_eq!(packed[0], 0b00_01_10_11);
+        assert_eq!(packed[1], 0b00_000000);
+        // Row 1: samples 3,2,1,0 -> 0b11_10_01_00 = 0xE4; sample 1 -> 0b01_000000 = 0x40.
+        assert_eq!(packed[2], 0b11_10_01_00);
+        assert_eq!(packed[3], 0b01_000000);
+    }
+
+    #[test]
+    fn repack_subbyte_1bit_and_4bit_pack_expected_bytes() {
+        // 1-bit, 9 samples/row -> 2 bytes/row, trailing 7 bits zero.
+        let row = vec![1u8, 0, 1, 1, 0, 0, 1, 0, 1];
+        let packed = super::repack_subbyte_msb_first(&row, 9, 1, 1).unwrap();
+        assert_eq!(packed, vec![0b1011_0010, 0b1_0000000]);
+
+        // 4-bit, 3 samples/row -> 2 bytes/row, trailing nibble zero.
+        let row = vec![0u8, 5, 15];
+        let packed = super::repack_subbyte_msb_first(&row, 3, 1, 4).unwrap();
+        assert_eq!(packed, vec![0x05, 0xF0]);
+    }
+
+    #[test]
+    fn repack_subbyte_rejects_sample_count_mismatch() {
+        let err = super::repack_subbyte_msb_first(&[0u8, 1, 2], 5, 1, 2).unwrap_err();
+        assert!(matches!(err, Error::InvalidImageLayout(_)));
     }
 
     #[test]
