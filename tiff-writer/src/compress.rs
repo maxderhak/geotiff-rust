@@ -804,8 +804,9 @@ mod tests {
         use weezl::encode::Encoder;
         use weezl::BitOrder;
 
-        // High-entropy, halftone-shaped 2-bit-packed data, large enough to
-        // cross the 9->10->11->12-bit code-size switches and force a ClearCode.
+        // High-entropy, halftone-shaped 2-bit-packed data, one 8192-byte block:
+        // large enough to exercise the encoder's dictionary / code-size
+        // machinery (the specific code-size transitions are not asserted here).
         let mut state: u32 = 0x9E37_79B9;
         let mut data = Vec::with_capacity(8192);
         for _ in 0..8192 {
