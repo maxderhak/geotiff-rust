@@ -727,10 +727,16 @@ impl TiffFile {
     /// (this method also returns [`Err`]`(`[`Error::InvalidImageLayout`]`)` for
     /// planar sub-byte storage — use the per-band packed accessors there).
     /// Sub-byte rows are packed as `ceil(cols * samples_per_pixel * bits / 8)`
-    /// MSB-first bytes. A full-width window (`col_off == 0`, `cols == width`) on
-    /// chunky storage reproduces the exact on-disk bytes; with `col_off > 0` or
-    /// `cols < width`, sub-byte samples are re-packed starting fresh at bit 0 of
-    /// each output row (a valid packed representation of the sub-window, not a
+    /// MSB-first bytes. On chunky storage the packed bytes are the **exact
+    /// on-disk bytes** (trailing padding bits included) for every **byte-aligned**
+    /// window: the left edge starts on a byte boundary in the packed row
+    /// (`col_off * samples_per_pixel * bits` a multiple of 8) and the right edge
+    /// either ends on a byte boundary or runs to the image width (`col_off == 0`,
+    /// `cols == width` is the common special case). For a genuinely
+    /// **bit-granular** window (a mid-byte `col_off`, or a partial-width window
+    /// ending mid-byte before the image edge) the selected sub-byte samples are
+    /// re-packed starting fresh at bit 0 of each output row (a valid packed
+    /// representation of the sub-window with zero-filled trailing padding, not a
     /// copy of a mid-byte on-disk range).
     pub fn read_window_packed_bytes(
         &self,
@@ -761,13 +767,14 @@ impl TiffFile {
 
     /// Decode a single storage-domain band into raw on-disk **packed** bytes.
     ///
-    /// Sub-byte bands are packed as `ceil(cols * bits / 8)` MSB-first bytes per
-    /// sample-plane row (the per-plane on-disk layout for planar images); a
-    /// full-width read (`col_off == 0`, `cols == width`) reproduces that plane's
-    /// exact on-disk bytes. With `col_off > 0` or `cols < width`, sub-byte
-    /// samples are re-packed starting fresh at bit 0 of each output row (not a
-    /// copy of a mid-byte on-disk range). Unlike the non-band packed accessors,
-    /// this works for both chunky and planar storage.
+    /// This reads the band at full extent (all rows and columns), so sub-byte
+    /// bands are packed as `ceil(width * bits / 8)` MSB-first bytes per
+    /// sample-plane row and reproduce that plane's **exact on-disk bytes**
+    /// (trailing padding included) for both chunky and planar storage. Unlike the
+    /// non-band packed accessors, this works for planar sub-byte layouts. For a
+    /// column sub-window (with a `col_off` / `cols` argument) see
+    /// [`read_band_window_packed_bytes`](Self::read_band_window_packed_bytes),
+    /// which documents when the sub-window is verbatim vs re-packed from bit 0.
     pub fn read_band_packed_bytes(&self, ifd_index: usize, band_index: usize) -> Result<Vec<u8>> {
         let ifd = self.ifd(ifd_index)?;
         self.read_band_packed_bytes_from_ifd(ifd, band_index)
@@ -789,6 +796,23 @@ impl TiffFile {
 
     /// Decode a pixel window from one storage-domain band into raw on-disk
     /// **packed** bytes.
+    ///
+    /// Sub-byte bands are packed as `ceil(cols * bits / 8)` MSB-first bytes per
+    /// sample-plane row. For every **byte-aligned** window — the left edge on a
+    /// byte boundary in the sample-plane row (`col_off * bits` a multiple of 8)
+    /// and the right edge on a byte boundary or at the image width (`col_off == 0`,
+    /// `cols == width` is the common special case) — the packed bytes are that
+    /// plane's **exact on-disk bytes**, trailing padding bits included. For a
+    /// genuinely **bit-granular** window (a mid-byte `col_off`, or a partial-width
+    /// window ending mid-byte before the image edge) the selected samples are
+    /// re-packed starting fresh at bit 0 of each output row (zero-filled trailing
+    /// padding, not a copy of a mid-byte on-disk range). The verbatim path is
+    /// available only for **planar** (`PlanarConfiguration=2`) sub-byte storage,
+    /// where each band is a contiguous per-plane region on disk; a **chunky**
+    /// sub-byte band is bit-interleaved with its neighbours, so a single band is
+    /// never a whole-byte on-disk run and is always re-packed (padding zeroed),
+    /// though the samples are byte-exact. Byte-aligned (>=8-bit) depths return the
+    /// unpacked storage bytes unchanged for either layout.
     pub fn read_band_window_packed_bytes(
         &self,
         ifd_index: usize,
@@ -882,12 +906,18 @@ impl TiffFile {
 
     /// Decode a window into interleaved packed storage bytes.
     ///
-    /// For a **full-width sub-byte chunky** window this decodes the strips and
+    /// For a **byte-aligned sub-byte chunky** window this decodes the strips and
     /// returns the packed rows **verbatim** (the sub-byte unpack and per-sample
     /// re-interleave are skipped), so the on-disk trailing padding bits survive
-    /// byte-exact. Every other sub-byte shape (a column sub-window, or tiled
-    /// storage whose per-tile packing does not align to a full-width row) reuses
-    /// the bounded/windowed unpacked decode and re-packs sub-byte samples
+    /// byte-exact. "Byte-aligned" means the window's left edge starts on a byte
+    /// boundary in the packed row (`col_off * samples_per_pixel * bits` a
+    /// multiple of 8) and its right edge either ends on a byte boundary or runs
+    /// to the image width (see [`packed_col_window_is_byte_aligned`]); a
+    /// full-width window is the common special case. Every genuinely
+    /// **bit-granular** sub-byte window (a mid-byte `col_off`, or a partial-width
+    /// window ending mid-byte before the image edge) and all tiled sub-byte
+    /// storage (whose per-tile packing does not align to a full-width row) reuse
+    /// the bounded/windowed unpacked decode and re-pack sub-byte samples
     /// MSB-first (the exact inverse of the reader's sub-byte unpack); a re-pack
     /// starts fresh at bit 0, so its trailing padding is zero. For byte-aligned
     /// depths the unpacked storage bytes are already packed and returned unchanged.
@@ -910,24 +940,39 @@ impl TiffFile {
                 layout.planar_configuration
             )));
         }
-        // Verbatim fast path: a full-width sub-byte chunky window is exactly the
-        // decompressed packed rows on disk, so copy them out without the
-        // unpack->repack round-trip (which would zero the padding bits). Only
-        // strips have full-width packed rows; a sub-byte tile packs to its own
-        // padded tile_width, so tiled storage falls through to the repack path.
-        if layout.bits_per_sample < 8
-            && !ifd.is_tiled()
-            && window.col_off == 0
-            && window.cols == layout.width
-        {
-            return strip::read_window_packed(
-                self.source.as_ref(),
-                ifd,
-                self.byte_order(),
-                &self.block_cache,
-                window,
-                self.decode_read_options(),
+        // Verbatim fast path: a byte-aligned sub-byte chunky window is a
+        // contiguous whole-byte sub-range of the decompressed packed rows on
+        // disk, so copy those bytes out without the unpack->repack round-trip
+        // (which would zero the padding bits). Only strips have full-width
+        // packed rows; a sub-byte tile packs to its own padded tile_width, so
+        // tiled storage falls through to the repack path. The planar guard above
+        // has already returned for non-chunky sub-byte, so reaching here with
+        // bits < 8 implies chunky -- an ordering-coupled invariant.
+        if layout.bits_per_sample < 8 && !ifd.is_tiled() {
+            debug_assert_eq!(
+                layout.planar_configuration, 1,
+                "planar sub-byte is rejected above; the chunky verbatim path assumes chunky layout"
             );
+            if let Some(unit_bits) = layout
+                .samples_per_pixel
+                .checked_mul(layout.bits_per_sample as usize)
+            {
+                if packed_col_window_is_byte_aligned(
+                    window.col_off,
+                    window.col_end(),
+                    layout.width,
+                    unit_bits,
+                ) {
+                    return strip::read_window_packed(
+                        self.source.as_ref(),
+                        ifd,
+                        self.byte_order(),
+                        &self.block_cache,
+                        window,
+                        self.decode_read_options(),
+                    );
+                }
+            }
         }
         let unpacked = self.decode_window_sample_bytes(ifd, window)?;
         if layout.bits_per_sample >= 8 {
@@ -949,12 +994,15 @@ impl TiffFile {
     /// Decode a window from one band into packed sample-plane bytes.
     ///
     /// See [`decode_window_packed_bytes`](Self::decode_window_packed_bytes).
-    /// A **full-width sub-byte planar** (`PlanarConfiguration=2`) band is a
-    /// contiguous packed region on disk, so its packed sample-plane rows are
-    /// returned verbatim (unpack skipped, padding preserved). Otherwise (a
-    /// chunky/bit-interleaved band, a column sub-window, or tiled storage) the
-    /// band is decoded and its `window.cols` samples per row are re-packed into
-    /// `ceil(cols * bits / 8)` MSB-first bytes (padding zeroed).
+    /// A **byte-aligned sub-byte planar** (`PlanarConfiguration=2`) band window is
+    /// a contiguous whole-byte sub-range of that plane's packed region on disk
+    /// (`col_off * bits` a multiple of 8 and the right edge on a byte boundary or
+    /// at the image width, per [`packed_col_window_is_byte_aligned`]), so its
+    /// packed sample-plane bytes are returned verbatim (unpack skipped, padding
+    /// preserved); a full-width window is the common special case. Otherwise (a
+    /// chunky/bit-interleaved band, a bit-granular column sub-window, or tiled
+    /// storage) the band is decoded and its `window.cols` samples per row are
+    /// re-packed into `ceil(cols * bits / 8)` MSB-first bytes (padding zeroed).
     fn decode_window_packed_band_bytes(
         &self,
         ifd: &Ifd,
@@ -965,16 +1013,21 @@ impl TiffFile {
             return Ok(Vec::new());
         }
         let layout = ifd.raster_layout()?;
-        // Verbatim fast path: a full-width sub-byte planar band is stored as a
-        // contiguous per-plane packed region, so copy its packed rows out
-        // without the unpack->repack round-trip. A chunky sub-byte band is
-        // bit-interleaved with the other bands, so extracting one band can never
-        // be a verbatim copy of an on-disk range -- it stays on the repack path.
+        // Verbatim fast path: a byte-aligned sub-byte planar band window is a
+        // contiguous whole-byte sub-range of the band's per-plane packed region,
+        // so copy those bytes out without the unpack->repack round-trip. A chunky
+        // sub-byte band is bit-interleaved with the other bands, so extracting
+        // one band can never be a verbatim copy of an on-disk range -- it stays
+        // on the repack path, as does a bit-granular planar window.
         if layout.bits_per_sample < 8
             && layout.planar_configuration == 2
             && !ifd.is_tiled()
-            && window.col_off == 0
-            && window.cols == layout.width
+            && packed_col_window_is_byte_aligned(
+                window.col_off,
+                window.col_end(),
+                layout.width,
+                layout.bits_per_sample as usize,
+            )
         {
             return strip::read_window_band_packed(
                 self.source.as_ref(),
@@ -1251,6 +1304,41 @@ fn validate_window(
         rows,
         cols,
     })
+}
+
+/// Whether a sub-byte column window can be served as a **verbatim** byte copy
+/// of the on-disk packed rows (padding preserved) rather than an unpack→repack.
+///
+/// `unit_bits` is the packed bit stride per column in the stream being copied:
+/// `samples_per_pixel * bits` for a chunky interleaved row, or `bits` for a
+/// single sample-plane (planar band) row. The window's byte sub-range is
+/// `[col_off * unit_bits / 8, ceil(col_end * unit_bits / 8))` of each row, so a
+/// verbatim copy is correct exactly when:
+///
+/// 1. the left edge is byte-aligned (`col_off * unit_bits` a multiple of 8) — so
+///    the first byte holds no sample from a column left of the window, and
+/// 2. the right edge either lands on a byte boundary (`col_end * unit_bits` a
+///    multiple of 8) **or** runs to the image width (`col_end == width`) — so the
+///    final byte's spare bits are the row's own trailing padding, never a real
+///    sample from a column right of the window.
+///
+/// A window failing either test is genuinely bit-granular and must be re-packed
+/// from bit 0 (padding zeroed). Overflow in the bit math conservatively returns
+/// `false` (fall back to the always-correct repack path).
+fn packed_col_window_is_byte_aligned(
+    col_off: usize,
+    col_end: usize,
+    width: usize,
+    unit_bits: usize,
+) -> bool {
+    match col_off.checked_mul(unit_bits) {
+        Some(start_bits) if start_bits % 8 == 0 => {}
+        _ => return false,
+    }
+    if col_end == width {
+        return true;
+    }
+    matches!(col_end.checked_mul(unit_bits), Some(end_bits) if end_bits % 8 == 0)
 }
 
 /// Re-pack one-byte-per-sample values into MSB-first sub-byte storage bytes.

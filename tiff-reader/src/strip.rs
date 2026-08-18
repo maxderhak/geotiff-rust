@@ -70,15 +70,19 @@ pub(crate) fn read_window(
     Ok(output)
 }
 
-/// Read a full-width sub-byte window as raw **packed** on-disk rows, verbatim.
+/// Read a byte-aligned sub-byte window as raw **packed** on-disk rows, verbatim.
 ///
 /// Unlike [`read_window`], the sub-byte unpack (and the per-sample re-interleave
-/// copy) is skipped: each strip decodes to its packed rows and whole rows are
-/// copied out, so the trailing padding bits survive byte-exact to disk. Only
-/// valid for chunky (`PlanarConfiguration=1`) sub-byte storage with a
-/// full-width window (`col_off == 0 && cols == width`); the caller
+/// copy) is skipped: each strip decodes to its full-width packed rows and the
+/// window's byte sub-range is copied out, so the trailing padding bits survive
+/// byte-exact to disk. Only valid for chunky (`PlanarConfiguration=1`) sub-byte
+/// storage with a window whose left edge is byte-aligned in the packed stream
+/// (`col_off * samples_per_pixel * bits` a multiple of 8) and whose byte
+/// sub-range holds only the window's samples plus at most the row's real
+/// trailing padding; the caller
 /// ([`decode_window_packed_bytes`](crate::TiffFile::read_image_packed_bytes))
-/// enforces that and routes every other shape through the re-pack path.
+/// enforces that and routes every other (bit-granular) shape through the
+/// re-pack path.
 pub(crate) fn read_window_packed(
     source: &dyn TiffSource,
     ifd: &Ifd,
@@ -92,12 +96,23 @@ pub(crate) fn read_window_packed(
         return Ok(Vec::new());
     }
     debug_assert_eq!(layout.planar_configuration, 1);
-    debug_assert!(window.col_off == 0 && window.cols == layout.width);
+    let unit_bits = layout
+        .samples_per_pixel
+        .checked_mul(layout.bits_per_sample as usize)
+        .ok_or_else(|| Error::InvalidImageLayout("packed unit bit stride overflows usize".into()))?;
+    let src_bit_offset = checked_layout_mul(window.col_off, unit_bits, "packed column bit offset")?;
+    debug_assert_eq!(
+        src_bit_offset % 8,
+        0,
+        "verbatim packed read requires a byte-aligned window left edge"
+    );
+    let src_byte_offset = src_bit_offset / 8;
     let ifd_offset = ifd.offset();
     let context = block_decode::BlockDecodeContext::new(ifd, layout, byte_order)?;
 
-    let row_bytes = layout.checked_packed_row_bytes()?;
-    let output_len = checked_layout_mul(window.rows, row_bytes, "packed window output length")?;
+    let src_row_bytes = layout.checked_packed_row_bytes()?;
+    let out_row_bytes = layout.checked_packed_row_bytes_for_width(window.cols)?;
+    let output_len = checked_layout_mul(window.rows, out_row_bytes, "packed window output length")?;
     let mut output = allocate_decode_output(output_len, options.decode_output_bytes)?;
 
     let relevant_specs = collect_strip_specs_for_window(ifd, &layout, window, None)?;
@@ -109,7 +124,15 @@ pub(crate) fn read_window_packed(
             let (block, block_spec) = read_strip_block_for_window(
                 source, ifd_offset, cache, spec, &context, window, options, true,
             )?;
-            copy_strip_packed_window_block(&mut output.lock(), block.as_slice(), block_spec, row_bytes, window)?;
+            copy_strip_packed_window_block(
+                &mut output.lock(),
+                block.as_slice(),
+                block_spec,
+                src_row_bytes,
+                src_byte_offset,
+                out_row_bytes,
+                window,
+            )?;
             Ok::<(), Error>(())
         })?;
     }
@@ -119,7 +142,15 @@ pub(crate) fn read_window_packed(
         let (block, block_spec) = read_strip_block_for_window(
             source, ifd_offset, cache, spec, &context, window, options, true,
         )?;
-        copy_strip_packed_window_block(&mut output, block.as_slice(), block_spec, row_bytes, window)?;
+        copy_strip_packed_window_block(
+            &mut output,
+            block.as_slice(),
+            block_spec,
+            src_row_bytes,
+            src_byte_offset,
+            out_row_bytes,
+            window,
+        )?;
     }
 
     Ok(output)
@@ -189,15 +220,19 @@ pub(crate) fn read_window_band(
     Ok(output)
 }
 
-/// Read one band's full-width sub-byte window as raw **packed** on-disk
+/// Read one band's byte-aligned sub-byte window as raw **packed** on-disk
 /// sample-plane rows, verbatim (unpack skipped, padding preserved).
 ///
 /// Only valid for planar (`PlanarConfiguration=2`) sub-byte storage with a
-/// full-width window; each plane is a contiguous packed region on disk, so the
-/// packed rows copy out verbatim. The caller
+/// window whose left edge is byte-aligned in the packed sample-plane stream
+/// (`col_off * bits` a multiple of 8) and whose byte sub-range holds only the
+/// window's samples plus at most the plane row's real trailing padding; each
+/// plane is a contiguous packed region on disk, so those bytes copy out
+/// verbatim. The caller
 /// ([`decode_window_packed_band_bytes`](crate::TiffFile::read_band_packed_bytes))
-/// enforces that and routes chunky (bit-interleaved) bands through the re-pack
-/// path, where extracting one band cannot be a verbatim copy of an on-disk range.
+/// enforces that and routes chunky (bit-interleaved) bands and bit-granular
+/// windows through the re-pack path, where extracting the band cannot be a
+/// verbatim copy of an on-disk range.
 pub(crate) fn read_window_band_packed(
     source: &dyn TiffSource,
     ifd: &Ifd,
@@ -218,12 +253,20 @@ pub(crate) fn read_window_band_packed(
         return Ok(Vec::new());
     }
     debug_assert_eq!(layout.planar_configuration, 2);
-    debug_assert!(window.col_off == 0 && window.cols == layout.width);
+    let unit_bits = layout.bits_per_sample as usize;
+    let src_bit_offset = checked_layout_mul(window.col_off, unit_bits, "packed column bit offset")?;
+    debug_assert_eq!(
+        src_bit_offset % 8,
+        0,
+        "verbatim packed band read requires a byte-aligned window left edge"
+    );
+    let src_byte_offset = src_bit_offset / 8;
     let ifd_offset = ifd.offset();
     let context = block_decode::BlockDecodeContext::new(ifd, layout, byte_order)?;
 
-    let row_bytes = layout.checked_packed_sample_plane_row_bytes()?;
-    let output_len = checked_layout_mul(window.rows, row_bytes, "packed band output length")?;
+    let src_row_bytes = layout.checked_packed_sample_plane_row_bytes()?;
+    let out_row_bytes = layout.checked_packed_sample_plane_row_bytes_for_width(window.cols)?;
+    let output_len = checked_layout_mul(window.rows, out_row_bytes, "packed band output length")?;
     let mut output = allocate_decode_output(output_len, options.decode_output_bytes)?;
 
     let relevant_specs = collect_strip_specs_for_window(ifd, &layout, window, Some(band_index))?;
@@ -235,7 +278,15 @@ pub(crate) fn read_window_band_packed(
             let (block, block_spec) = read_strip_block_for_window(
                 source, ifd_offset, cache, spec, &context, window, options, true,
             )?;
-            copy_strip_packed_window_block(&mut output.lock(), block.as_slice(), block_spec, row_bytes, window)?;
+            copy_strip_packed_window_block(
+                &mut output.lock(),
+                block.as_slice(),
+                block_spec,
+                src_row_bytes,
+                src_byte_offset,
+                out_row_bytes,
+                window,
+            )?;
             Ok::<(), Error>(())
         })?;
     }
@@ -245,21 +296,41 @@ pub(crate) fn read_window_band_packed(
         let (block, block_spec) = read_strip_block_for_window(
             source, ifd_offset, cache, spec, &context, window, options, true,
         )?;
-        copy_strip_packed_window_block(&mut output, block.as_slice(), block_spec, row_bytes, window)?;
+        copy_strip_packed_window_block(
+            &mut output,
+            block.as_slice(),
+            block_spec,
+            src_row_bytes,
+            src_byte_offset,
+            out_row_bytes,
+            window,
+        )?;
     }
 
     Ok(output)
 }
 
-/// Copy whole packed rows for the window's row range out of a decoded packed
-/// block. Full-width only: each raster row is exactly `row_bytes` on disk and
-/// in the output, so the copy is a contiguous whole-row memcpy with no column
-/// slicing or bit re-interleave (that is what keeps the padding bits verbatim).
+/// Copy the packed byte sub-range for the window's row range out of a decoded
+/// packed block, verbatim.
+///
+/// Each decoded row is `src_row_bytes` wide (the full-width packed row); the
+/// window's columns occupy the contiguous byte sub-range
+/// `[src_byte_offset, src_byte_offset + out_row_bytes)` of that row. The caller
+/// ([`decode_window_packed_bytes`](crate::TiffFile::read_image_packed_bytes) /
+/// [`decode_window_packed_band_bytes`](crate::TiffFile::read_band_packed_bytes))
+/// only routes here when the window's left edge is byte-aligned in the packed
+/// stream *and* its byte sub-range holds only the window's own samples plus (at
+/// most) the row's real trailing padding — so this whole-byte memcpy needs no
+/// column slicing or bit re-interleave, which is what keeps the on-disk padding
+/// bits verbatim. For a full-width window `src_byte_offset == 0` and
+/// `out_row_bytes == src_row_bytes`, reducing to a whole-row copy.
 fn copy_strip_packed_window_block(
     output: &mut [u8],
     block: &[u8],
     spec: StripBlockSpec,
-    row_bytes: usize,
+    src_row_bytes: usize,
+    src_byte_offset: usize,
+    out_row_bytes: usize,
     window: Window,
 ) -> Result<()> {
     let block_row_end = checked_layout_add(spec.row_start, spec.rows_in_strip, "strip row range")?;
@@ -268,13 +339,17 @@ fn copy_strip_packed_window_block(
     for row in copy_row_start..copy_row_end {
         let src_row_index = row - spec.row_start;
         let dest_row_index = row - window.row_off;
-        let src_offset =
-            checked_layout_mul(src_row_index, row_bytes, "packed strip source row offset")?;
+        let src_offset = checked_layout_add(
+            checked_layout_mul(src_row_index, src_row_bytes, "packed strip source row offset")?,
+            src_byte_offset,
+            "packed strip source column offset",
+        )?;
         let dest_offset =
-            checked_layout_mul(dest_row_index, row_bytes, "packed strip output row offset")?;
-        let src_end = checked_layout_add(src_offset, row_bytes, "packed strip source row range")?;
+            checked_layout_mul(dest_row_index, out_row_bytes, "packed strip output row offset")?;
+        let src_end =
+            checked_layout_add(src_offset, out_row_bytes, "packed strip source row range")?;
         let dest_end =
-            checked_layout_add(dest_offset, row_bytes, "packed strip output row range")?;
+            checked_layout_add(dest_offset, out_row_bytes, "packed strip output row range")?;
         output[dest_offset..dest_end].copy_from_slice(&block[src_offset..src_end]);
     }
     Ok(())
