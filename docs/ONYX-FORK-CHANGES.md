@@ -390,6 +390,33 @@ note.
   silently mis-encode" posture elsewhere.
 - **Sub-byte write rejects predictors and LERC** at build time rather than
   emitting undefined output. Same posture as above.
+- **The reader's `Separated ⇒ ≥4 samples` rule is kept, NOT relaxed.**
+  `color_model()` (`tiff-reader/src/ifd.rs`) defaults an absent `InkSet` to
+  `Cmyk` (per TIFF 6.0 §17) and then requires `SamplesPerPixel ≥ 4`, refusing a
+  3-sample `Separated` image with *"Separated ... requires at least 4 samples"*.
+  Onyx hit a real file that trips this — a driver pass-through tagged
+  `Photometric=5` with `spp=3` and no `InkSet`/`InkNames` — and evaluated
+  relaxing the rule to derive `color_channels = spp − extra_samples` (the same
+  N-ink derivation the explicit-`InkSet=2` branch already uses). **We decided
+  against relaxing it, on 2026-08-18, because the reference implementation draws
+  the same line.** libtiff is two-tier: its *raw* decode path
+  (`tif_read.c`, `TIFFReadScanline`/`TIFFReadEncodedStrip`) is
+  photometric-agnostic and reads such a file as opaque samples with no color
+  meaning, but its *color-aware* path (`tif_getimage.c`, `TIFFRGBAImageOK`)
+  **refuses** it identically — `if (td->td_samplesperpixel < 4) { "Sorry, can
+  not handle separated image with Samples/pixel=..." }` — and never fabricates a
+  3-ink interpretation (its defaulted `NumberOfInks` is hardcoded `4`, not
+  `spp`; `tif_aux.c`). This fork's `color_model()` is the analogue of libtiff's
+  color-aware tier, so refusing a 3-sample `Separated` is *correct* behavior for
+  it, not a gap. A 3-sample `Separated` file is internally contradictory
+  (CMYK-default implies 4 inks) and is almost always mislabeled RGB; the right
+  fixes are (a) read it through a raw/opaque tier if truly needed, and (b) stop
+  emitting the mislabeled tag at the source — which is what Onyx did (the
+  emitter already writes `Photometric=2` for RGB; the offending file was a stale
+  pre-fix capture). An upstream maintainer who *wants* a permissive N-ink
+  `Separated` reader could add it as an explicit opt-in tier rather than
+  loosening the default color model — worth a conversation, but the strict
+  default should stay the default.
 
 ## 5. Known limitations & deferred follow-ons
 
