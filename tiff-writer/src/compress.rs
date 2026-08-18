@@ -651,6 +651,22 @@ fn forward_float_predictor(buf: &mut [u8], bit_depth: u16, samples: u16, byte_or
     buf.copy_from_slice(&tmp);
 }
 
+/// LZW-compress a whole strip/tile block for TIFF.
+///
+/// This encodes the block in a single **one-shot** call: `Encoder::encode` is
+/// weezl's `into_vec().encode_all()`, which emits the leading `ClearCode`,
+/// the code stream (with TIFF early code-size switches), and the trailing
+/// `EndOfInformation` marker, then pads to a byte boundary. The output is
+/// byte-for-byte identical to `into_stream().encode_all()`.
+///
+/// Emitting the finished stream in one shot is what makes `write_block` LZW
+/// output decodable by a *strict* TIFF LZW decoder (one that requires the end
+/// marker — the fork's own reader does; see `tiff-reader/src/filters.rs`). Do
+/// **not** replace this with a bare incremental `encode_bytes` loop that omits
+/// the terminating `finish()`/end code: the resulting stream ends without an
+/// `EndOfInformation` code and strict decoders reject it as truncated. The
+/// unit test `compress_lzw_matches_one_shot_encode_all_and_is_decodable`
+/// guards this contract.
 fn compress_lzw(data: &[u8], index: usize) -> Result<Vec<u8>> {
     use weezl::encode::Encoder;
     use weezl::BitOrder;
@@ -774,6 +790,53 @@ mod tests {
         let data = vec![1u8, 2, 3, 4, 5, 6];
         let compressed = compress(&data, Compression::None, 0).unwrap();
         assert_eq!(compressed, data);
+    }
+
+    /// Guard: `compress_lzw` must emit a fully-finished, one-shot LZW stream —
+    /// byte-identical to `into_stream().encode_all()` (with a trailing
+    /// `EndOfInformation` code) — so that a strict TIFF LZW decoder can decode
+    /// `write_block` output. A refactor to a non-finishing incremental encoder
+    /// (e.g. raw `encode_bytes` without `finish()`) would omit the end marker
+    /// and fail this test. See `docs/ONYX-FORK-CHANGES.md` §5.
+    #[test]
+    fn compress_lzw_matches_one_shot_encode_all_and_is_decodable() {
+        use std::io::Cursor;
+        use weezl::encode::Encoder;
+        use weezl::BitOrder;
+
+        // High-entropy, halftone-shaped 2-bit-packed data, large enough to
+        // cross the 9->10->11->12-bit code-size switches and force a ClearCode.
+        let mut state: u32 = 0x9E37_79B9;
+        let mut data = Vec::with_capacity(8192);
+        for _ in 0..8192 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data.push((state as u8) & 0b11);
+        }
+
+        // The fork's write_block LZW path.
+        let produced = compress_lzw(&data, 0).unwrap();
+
+        // The canonical one-shot path Onyx verified as decodable downstream.
+        let mut canonical = Vec::new();
+        Encoder::with_tiff_size_switch(BitOrder::Msb, 8)
+            .into_stream(Cursor::new(&mut canonical))
+            .encode_all(Cursor::new(&data[..]))
+            .status
+            .unwrap();
+
+        assert_eq!(
+            produced, canonical,
+            "compress_lzw output must be byte-identical to into_stream().encode_all() \
+             (a finished one-shot stream)"
+        );
+
+        // And it must round-trip through a TIFF-mode LZW decoder.
+        let decoded = weezl::decode::Decoder::with_tiff_size_switch(BitOrder::Msb, 8)
+            .decode(&produced)
+            .expect("compress_lzw output must be decodable to completion");
+        assert_eq!(decoded, data);
     }
 
     #[test]
