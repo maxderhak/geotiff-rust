@@ -65,6 +65,7 @@ for a contribution.
 | 6 | Planar packed sub-byte guard | `a126bd7` | `tiff-reader` | No new API; non-band packed accessors now `Err(Error::InvalidImageLayout)` on planar sub-byte |
 | 7 | Verbatim packed read (perf) | `e1d41e8` | `tiff-reader` | No new API; packed accessors return decompressed packed rows verbatim on the full-width fast path |
 | 8 | No photometric-synthesized `ExtraSamples` — emit only what the caller declares | _(this session)_ | `tiff-writer` | No new API; every photometric writes `ExtraSamples` only when explicitly declared (matches libtiff `TIFFTAG_EXTRASAMPLES` semantics) |
+| 9 | LZW decode: stop at the caller-declared block size, matching libtiff | _(this session)_ | `tiff-reader` | No new API; `decompress_lzw` no longer errors on real-world libtiff LZW streams whose trailing bits (after the last pixel-producing code) don't form another valid code |
 
 (`bfe8bdb` is a trivial clippy `needless_range_loop` cleanup inside the sub-byte
 write test and adds no product behavior; it is folded into change #1.)
@@ -433,6 +434,107 @@ reviewers: a strict reader that *expects* every extra plane of a multi-channel
 image to be tagged `ExtraSamples` would see undeclared planes here as image data;
 this is the intended interpretation and, per the above, is consistent with
 libtiff's documented lenient default.)
+
+### 3.9 LZW decode: stop at the caller-declared block size, matching libtiff — _(this session)_
+
+**Motivation.** Onyx's ICC-port image-parity work hit a real, libtiff-encoded
+LZW TIFF strip that this fork's reader failed to decode:
+`DecompressionFailed { index: N, reason: "LZW: invalid code in LZW stream" }`
+on one specific strip of an otherwise-normal multi-strip image. A reference
+decoder (Python `tifffile`) decoded the same file (including that strip)
+without error, and the fork's *own* `weezl`-based encoder → decoder
+round-trip already passed with zero failures — so the bug was specific to
+*decoding real libtiff LZW output*, not LZW decoding in general.
+
+**Root cause.** `decompress_lzw` (`tiff-reader/src/filters.rs`) already used
+`weezl`'s TIFF "early-change" code-width mode
+(`Configuration::with_tiff_size_switch`), so this was not an early-change bug.
+Instrumented probing of the failing strip's raw compressed bytes showed: the
+decoder consumes *every* input byte and produces *exactly* the expected
+number of output bytes — but the **same call** that produces the final few
+needed bytes then also tries to decode one further code from the
+now-exhausted bit stream and gets `Err(InvalidCode)`, because the trailing
+bits after the last real, pixel-producing code do not form another valid LZW
+code (byte-alignment padding / no clean trailing EOI at that exact bit
+position). This reproduced identically against both the pinned `weezl
+0.1.12` and the latest `weezl 0.2.1` (confirmed by temporarily bumping and
+re-running the repro), so it is not a `weezl`-version bug — the loop in
+`decompress_lzw` was asking the decoder to keep going (via its "probe one
+byte past the expected size" check, used to detect genuinely
+oversized/malformed streams) even after the block's entire real payload was
+already in hand.
+
+**What changed.** `decompress_lzw` now checks, immediately after each
+`decode_bytes` call appends to the output, whether `out.len()` has reached
+the caller-declared `decoded_len_limit` (the exact expected decoded size for
+this strip/tile, computed by the block-decode caller from image geometry) —
+and if so, returns `Ok(out)` immediately, **regardless of what status or
+error the decoder returned for that call**. This mirrors libtiff's own
+`LZWDecode`, which stops the instant it has produced the requested byte count
+for a strip and never inspects anything past that boundary. The existing
+"decoded block exceeds budget" guard (`out.len() > decoded_len_limit` fires
+first, unconditionally) is unchanged and still catches a genuinely oversized
+stream — that check can only fire when real decoded payload continues past
+the caller's declared size (i.e. `out.len()` becomes *strictly greater than*
+`decoded_len_limit`), which is exactly the case the new "reached exactly the
+limit" check does not touch. LZW decoding is not provisional: bytes already
+appended to `out` for already-decoded codes are final and correct regardless
+of what (if anything) a later call does with the remaining bits, so returning
+early here cannot produce wrong pixel data — only tolerates harmless trailing
+slack past the last real code.
+
+**Public API.** None. `decompress_lzw` behavior only changes for the exact
+boundary case described above; every other path (genuine mid-stream
+corruption, genuinely oversized streams, clean-EOI streams) is unchanged.
+
+**Tests.**
+`tiff-reader/tests/lzw_libtiff_repro.rs` uses a **fully synthetic** fixture,
+`testdata/lzw-libtiff/synthetic_exact_size_trailing_bits.lzw` (345 bytes, no
+third-party or licensed image data), engineered to reproduce the exact
+boundary condition above under full control rather than depending on a
+specific real-world file: a deterministic 300-byte payload (generated by a
+small LCG seeded `0x2545F491`, reproduced inline in the test so the expected
+decoded bytes are never hand-copied) is LZW-encoded with `weezl`'s own
+TIFF-compatible encoder (`Encoder::with_tiff_size_switch`), producing a
+normal, cleanly `EndOfInformation`-terminated stream; the fixture is that
+stream with its **last byte dropped** — the byte holding only the
+`EndOfInformation` code's tail and its padding bits, leaving every
+payload-producing code fully intact.
+`decodes_synthetic_lzw_stream_at_exact_declared_size_with_trailing_bits`
+decodes this fixture via the public `tiff_reader::filters::decompress` entry
+point with `decoded_len_limit` set to the payload's exact length (300) and
+asserts the output matches the regenerated payload byte-for-byte. Verified
+both directions directly against this fixture: with the guard temporarily
+removed, this call fails with `DecompressionFailed { reason: "LZW: stream
+ended before end marker" }` even though the 300 real bytes are already
+correctly decoded by that point; with the guard in place (current code) it
+returns `Ok` with the exact original bytes. A second test,
+`full_untruncated_stream_still_decodes_cleanly`, re-encodes the same payload
+without truncation as a contrast/sanity case, confirming the fix does not
+change behavior for a normal, cleanly-terminated stream. The existing
+`lzw_decoder_rejects_blocks_that_exceed_budget` unit test (a genuinely
+oversized `weezl`-encoded stream) and `lzw_real_cog_tile_requires_repeated_trailer_bytes`
+(a real GDAL/COG LZW tile, both with and without its trailer bytes) still pass
+unmodified, confirming the overshoot guard and existing real-file LZW paths
+are unaffected. Full `tiff-reader`, `tiff-core`, and `tiff-writer` suites
+(including the `weezl` round-trip tests `compress::tests::roundtrip_lzw` and
+`compress::tests::compress_lzw_matches_one_shot_encode_all_and_is_decodable`)
+all pass.
+
+**`weezl` version note.** A `weezl 0.1.12 → 0.2.1` bump was evaluated first
+(0.2.1's changelog lists relevant-sounding fixes: a code-size-12 malformed
+stream detection gap, and a small-output-buffer `NoProgress` bug) but the
+version bump *alone*, without the loop fix above, did **not** resolve this
+repro — confirming the bug is in this fork's decode loop, not in `weezl`
+itself. The loop fix alone (with `weezl` left at the original pinned
+`0.1.12`) fully resolves the repro, so the dependency is **left unchanged**
+at `0.1.12` (least-invasive fix; also avoids `weezl 0.2.1`'s higher MSRV of
+Rust 1.88 against this workspace's declared `rust-version = "1.85"`).
+
+**Upstreamability.** A genuine correctness fix matching libtiff's documented
+behavior (stop at the declared byte count, never require/validate a trailing
+EOI once satisfied); low risk, since the overshoot/malformed-stream guards
+are unchanged and only the exact-boundary tolerance is new.
 
 ## 4. Design decisions worth upstream discussion
 

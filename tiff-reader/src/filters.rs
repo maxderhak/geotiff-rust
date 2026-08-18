@@ -177,6 +177,28 @@ fn decompress_lzw(data: &[u8], index: usize, decoded_len_limit: usize) -> Result
             return Err(decoded_block_too_large(index, "LZW", decoded_len_limit));
         }
 
+        // We now have exactly the caller-declared decoded size for this
+        // block (never more: `output_len` above is capped so a single call
+        // cannot overshoot it, and the `>` check just above already ruled
+        // out overshoot across calls). libtiff's own LZW decoder stops the
+        // instant it has produced the requested byte count for a
+        // strip/tile and never inspects anything past that boundary.
+        //
+        // Some real-world libtiff-encoded LZW streams leave a few bits
+        // after the last pixel-producing code that do not form another
+        // valid code -- e.g. byte-alignment padding, or a final code that
+        // only makes sense once you already know decoding should stop
+        // here. The `probe_limit` above intentionally allows asking for
+        // one extra byte precisely so we can tell "the stream legitimately
+        // continues" (more real bytes come out, caught by the `>` check)
+        // apart from "this trailing slack doesn't decode at all" (an
+        // `Err`/incomplete status while `out.len()` is already exactly
+        // `decoded_len_limit`). Only the latter should be swallowed, to
+        // match libtiff's tolerance without weakening the overshoot guard.
+        if out.len() >= decoded_len_limit {
+            return Ok(out);
+        }
+
         match result.status {
             Err(e) => {
                 return Err(Error::DecompressionFailed {
