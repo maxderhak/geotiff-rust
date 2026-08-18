@@ -64,6 +64,7 @@ for a contribution.
 | 5 | Packed sub-byte read | `af42280` | `tiff-reader` | `TiffFile::read_image_packed_bytes`, `read_window_packed_bytes`, `read_band_packed_bytes`, `read_band_window_packed_bytes` (+ `*_from_ifd` variants) |
 | 6 | Planar packed sub-byte guard | `a126bd7` | `tiff-reader` | No new API; non-band packed accessors now `Err(Error::InvalidImageLayout)` on planar sub-byte |
 | 7 | Verbatim packed read (perf) | `e1d41e8` | `tiff-reader` | No new API; packed accessors return decompressed packed rows verbatim on the full-width fast path |
+| 8 | No photometric-synthesized `ExtraSamples` — emit only what the caller declares | _(this session)_ | `tiff-writer` | No new API; every photometric writes `ExtraSamples` only when explicitly declared (matches libtiff `TIFFTAG_EXTRASAMPLES` semantics) |
 
 (`bfe8bdb` is a trivial clippy `needless_range_loop` cleanup inside the sub-byte
 write test and adds no product behavior; it is folded into change #1.)
@@ -362,6 +363,76 @@ collide, across chunky and planar full-width reads.
 where a whole-row copy is valid, with a documented fallback everywhere else. The
 cache-key extension (packed vs unpacked) is a correctness detail reviewers should
 note.
+
+### 3.8 No photometric-synthesized `ExtraSamples` — emit only what the caller declares — _(this session)_
+
+**Motivation.** Onyx encodes **spectral** rasters as `MinIsBlack`/`MinIsWhite`
+with N samples, where every sample is a spectral band — all base image data,
+with **no** extra samples. The writer previously *synthesized* `ExtraSamples`
+(tag 338) for such an image, and — more broadly — for *any* photometric whose
+`samples_per_pixel` exceeded its fixed base: `effective_extra_samples()` derived
+a base sample count per photometric (1 for `MinIsBlack`/`MinIsWhite`/`Palette`/
+`Mask`, 3 for `Rgb`/`YCbCr`/`CieLab`/`IccLab`, 4 for `Separated` `InkSet::Cmyk`),
+then `effective_extra_samples_for_base()` PADDED the declared list to
+`spp − base` `Unspecified` codes, and the IFD emitter wrote the tag because the
+padded list was non-empty. So a spectral 5-band `MinIsBlack` got a bogus
+4-entry `ExtraSamples` tag, an `Rgb` spp=4 got 1 synthesized `Unspecified`, a
+`Separated` CMYK spp=6 got 2 — in every case a tag the caller never asked for,
+describing base image channels as extra samples.
+
+**What changed (one uniform change).** `effective_extra_samples_for_base()` no
+longer pads: after the existing per-photometric over-declaration guard it returns
+`self.extra_samples.clone()` directly — the extras the caller **explicitly**
+declared via `ImageBuilder::extra_samples(...)`, and nothing more. This is a
+single change routed through the shared path, so it is **uniform across every
+photometric**: a caller that declares no extras writes **no** `ExtraSamples` tag;
+a caller that declares extras writes exactly those codes. `implied_extra_samples`
+(`spp − base`) is still computed purely to keep the over-declaration guard **tight
+and per-photometric** (`declared > implied` → loud `InvalidConfig`; e.g. `Rgb`
+spp=4 still rejects >1 declared extra) — the guard is deliberately **not** loosened
+to a flat `<= samples_per_pixel`, which would let a caller null out an `Rgb`
+image's colour channels.
+
+**Reader — unchanged.** `resolve_fixed_model_extra_samples`
+(`tiff-reader/src/ifd.rs`) already tolerates an absent `ExtraSamples` tag: for a
+fixed-base photometric with `spp = N`, `declared = 0`, it resizes to `N − base`
+`Unspecified` **in memory** and returns `Ok`, so a file written without the tag
+reads back with byte-identical pixels (extras are metadata, never pixel bytes).
+The complaint was the *written* tag, not the in-memory model, so the reader is
+deliberately left as-is (proven by write→read byte-exact round-trip tests for
+`MinIsBlack`/`MinIsWhite`, `Rgb` spp=4, and `Separated` CMYK spp=6).
+
+**Public API.** None. Images simply no longer carry a synthesized `ExtraSamples`
+tag unless the caller declared extras.
+
+**Tests.** `integration-tests/tiff-integration/tests/minisx_extra_samples_write.rs`:
+(1) multi-sample `MinIsBlack` (spp=5) and `MinIsWhite` (spp=4) with no declared
+extras assert tag 338 is **absent** (these were the red-first cases); (2) the
+same, read back via `TiffFile`, assert `samples_per_pixel == N` and byte-exact
+pixels; (3) explicit-declaration cases across photometrics still emit exactly the
+declared codes (`MinIsBlack`/`MinIsWhite`, `Rgb`+alpha, `Separated` CMYK+2 spot);
+(4) the universal-scope cases — `Rgb` spp=4 and `Separated` CMYK spp=6 with no
+declared extras now write **no** tag (formerly 1 and 2 synthesized) and round-trip
+pixel-identical, with the reader still modelling `base + (N−base)` extras in
+memory; over-declaration still errors loudly for both `MinIsBlack` and `Rgb`.
+The pre-existing `nink_separated_write.rs` and `proptest_*` suites (which assert
+on the *reader's* in-memory model, or declare their extras explicitly) stay green.
+
+**Upstreamability — matches libtiff.** This *aligns* the fork with libtiff rather
+than diverging from it. libtiff writes `ExtraSamples` only when the application
+explicitly sets it: `tif_dirwrite.c` gates the field on `FIELD_EXTRASAMPLES`
+(verified in `tiff-4.0.3` — `TIFFWriteDirectorySec` writes tag 338 only under
+`TIFFFieldSet(tif, FIELD_EXTRASAMPLES)`), and `tif_dir.c`'s `setExtraSamples` is
+the only setter — the tag is never derived from photometric. On read, libtiff
+leniently defaults excess channels to `EXTRASAMPLE_UNSPECIFIED` without requiring
+the tag — exactly what this fork's reader already does (the tolerant resize
+above). So after this change the fork writes `ExtraSamples` solely when the client
+declares it, and both sides default excess channels leniently, matching libtiff.
+The write client owns declaring its real extras. (One mild semantic note for
+reviewers: a strict reader that *expects* every extra plane of a multi-channel
+image to be tagged `ExtraSamples` would see undeclared planes here as image data;
+this is the intended interpretation and, per the above, is consistent with
+libtiff's documented lenient default.)
 
 ## 4. Design decisions worth upstream discussion
 

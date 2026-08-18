@@ -911,9 +911,19 @@ impl ImageBuilder {
             )));
         }
 
-        let mut extra_samples = self.extra_samples.clone();
-        extra_samples.resize(implied_extra_samples as usize, ExtraSample::Unspecified);
-        Ok(extra_samples)
+        // Emit ONLY the extras the caller explicitly declared — never synthesize
+        // (pad) `implied - declared` `Unspecified` codes from the photometric.
+        // This matches libtiff, which writes the EXTRASAMPLES tag solely when the
+        // application sets `TIFFTAG_EXTRASAMPLES` (`tif_dirwrite.c`: the field is
+        // written only when `FIELD_EXTRASAMPLES` is set; `tif_dir.c` never derives
+        // it from photometric). The write client owns declaring its real extras;
+        // the reader tolerates an absent tag and defaults excess channels to
+        // `Unspecified` in memory, so a round-trip stays pixel-identical.
+        //
+        // `implied_extra_samples` is still computed above so the per-photometric
+        // over-declaration guard stays tight (e.g. RGB spp=4 rejects >1 declared
+        // extra), rather than loosening to a flat `<= samples_per_pixel`.
+        Ok(self.extra_samples.clone())
     }
 
     fn validate_jpeg_config(&self) -> crate::error::Result<()> {
