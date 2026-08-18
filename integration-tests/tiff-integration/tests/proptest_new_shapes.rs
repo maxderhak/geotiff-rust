@@ -184,6 +184,30 @@ fn apply_generic_color(ib: ImageBuilder, bands: u16) -> ImageBuilder {
     }
 }
 
+/// Resolve a proptest layout choice into a concrete `Layout`. `layout_choice`
+/// 0 = strips (with `rows_per_strip` clamped to the image height, so strip
+/// COUNT varies with the drawn value), 1 = a single square tile size.
+fn choose_layout(layout_choice: u8, rows_per_strip: u32, height: u32, tile_size: u32) -> Layout {
+    if layout_choice == 0 {
+        Layout::Strips {
+            rows_per_strip: rows_per_strip.min(height),
+        }
+    } else {
+        Layout::Tiles {
+            width: tile_size,
+            height: tile_size,
+        }
+    }
+}
+
+/// Apply a `Layout` to an `ImageBuilder`.
+fn apply_layout(ib: ImageBuilder, layout: Layout) -> ImageBuilder {
+    match layout {
+        Layout::Strips { rows_per_strip } => ib.strips(rows_per_strip),
+        Layout::Tiles { width, height } => ib.tiles(width, height),
+    }
+}
+
 fn writer_with(byte_order: ByteOrder) -> TiffWriter<Cursor<Vec<u8>>> {
     TiffWriter::new(
         Cursor::new(Vec::new()),
@@ -270,16 +294,7 @@ fn subbyte_config_strategy() -> impl Strategy<Value = SubByteConfig> {
                 tile_size,
                 byte_order,
             )| {
-                let layout = if layout_choice == 0 {
-                    Layout::Strips {
-                        rows_per_strip: rows_per_strip.min(height),
-                    }
-                } else {
-                    Layout::Tiles {
-                        width: tile_size,
-                        height: tile_size,
-                    }
-                };
+                let layout = choose_layout(layout_choice, rows_per_strip, height, tile_size);
                 SubByteConfig {
                     width,
                     height,
@@ -318,10 +333,7 @@ fn run_subbyte(cfg: SubByteConfig) {
         .compression(cfg.compression)
         .planar_configuration(cfg.planar);
     ib = apply_generic_color(ib, cfg.bands);
-    ib = match cfg.layout {
-        Layout::Strips { rows_per_strip } => ib.strips(rows_per_strip),
-        Layout::Tiles { width, height } => ib.tiles(width, height),
-    };
+    ib = apply_layout(ib, cfg.layout);
 
     let mut writer = writer_with(cfg.byte_order);
     let block_count = ib.checked_block_count().unwrap();
@@ -500,7 +512,7 @@ struct SeparatedConfig {
     extras: u16,
     planar: PlanarConfiguration,
     compression: Compression,
-    rows_per_strip: u32,
+    layout: Layout,
     byte_order: ByteOrder,
 }
 
@@ -511,9 +523,7 @@ impl SeparatedConfig {
             height: self.height,
             bands: self.spp,
             planar: self.planar,
-            layout: Layout::Strips {
-                rows_per_strip: self.rows_per_strip.min(self.height),
-            },
+            layout: self.layout,
         }
     }
     fn value(&self, block: usize, offset: usize) -> u8 {
@@ -547,11 +557,24 @@ fn separated_config_strategy() -> impl Strategy<Value = SeparatedConfig> {
         extras,
         planar,
         compression,
-        1u32..=4,
+        prop_oneof![Just(0u8), Just(1u8)], // strips vs tiles
+        1u32..=4,                          // rows per strip (clamped to height)
+        prop_oneof![Just(16u32), Just(32u32)],
         byte_order,
     )
         .prop_map(
-            |(width, height, spp, extras, planar, compression, rows_per_strip, byte_order)| {
+            |(
+                width,
+                height,
+                spp,
+                extras,
+                planar,
+                compression,
+                layout_choice,
+                rows_per_strip,
+                tile_size,
+                byte_order,
+            )| {
                 SeparatedConfig {
                     width,
                     height,
@@ -559,7 +582,7 @@ fn separated_config_strategy() -> impl Strategy<Value = SeparatedConfig> {
                     extras,
                     planar,
                     compression,
-                    rows_per_strip,
+                    layout: choose_layout(layout_choice, rows_per_strip, height, tile_size),
                     byte_order,
                 }
             },
@@ -573,15 +596,17 @@ fn run_separated(cfg: SeparatedConfig) {
     let spp = cfg.spp as usize;
 
     let extra_samples = vec![ExtraSample::Unspecified; cfg.extras as usize];
-    let ib = ImageBuilder::new(cfg.width, cfg.height)
-        .sample_type::<u8>()
-        .samples_per_pixel(cfg.spp)
-        .photometric(PhotometricInterpretation::Separated)
-        .ink_set(InkSet::NotCmyk)
-        .extra_samples(extra_samples)
-        .compression(cfg.compression)
-        .planar_configuration(cfg.planar)
-        .strips(cfg.rows_per_strip.min(cfg.height));
+    let ib = apply_layout(
+        ImageBuilder::new(cfg.width, cfg.height)
+            .sample_type::<u8>()
+            .samples_per_pixel(cfg.spp)
+            .photometric(PhotometricInterpretation::Separated)
+            .ink_set(InkSet::NotCmyk)
+            .extra_samples(extra_samples)
+            .compression(cfg.compression)
+            .planar_configuration(cfg.planar),
+        cfg.layout,
+    );
 
     let mut writer = writer_with(cfg.byte_order);
     let block_count = ib.checked_block_count().unwrap();
@@ -641,6 +666,7 @@ struct IccLabConfig {
     extra: bool,
     planar: PlanarConfiguration,
     compression: Compression,
+    layout: Layout,
     byte_order: ByteOrder,
 }
 
@@ -654,9 +680,7 @@ impl IccLabConfig {
             height: self.height,
             bands: self.spp(),
             planar: self.planar,
-            layout: Layout::Strips {
-                rows_per_strip: self.height,
-            },
+            layout: self.layout,
         }
     }
     fn u8_value(&self, block: usize, offset: usize) -> u8 {
@@ -690,16 +714,31 @@ fn icclab_config_strategy() -> impl Strategy<Value = IccLabConfig> {
         any::<bool>(),
         planar,
         compression,
+        prop_oneof![Just(0u8), Just(1u8)], // strips vs tiles
+        1u32..=4,                          // rows per strip (clamped to height)
+        prop_oneof![Just(16u32), Just(32u32)],
         byte_order,
     )
         .prop_map(
-            |(width, height, bits16, extra, planar, compression, byte_order)| IccLabConfig {
+            |(
                 width,
                 height,
                 bits16,
                 extra,
                 planar,
                 compression,
+                layout_choice,
+                rows_per_strip,
+                tile_size,
+                byte_order,
+            )| IccLabConfig {
+                width,
+                height,
+                bits16,
+                extra,
+                planar,
+                compression,
+                layout: choose_layout(layout_choice, rows_per_strip, height, tile_size),
                 byte_order,
             },
         )
@@ -715,14 +754,16 @@ fn run_icclab(cfg: IccLabConfig) {
     // The typed value read differs by depth; write + read + assert per depth.
     macro_rules! roundtrip {
         ($ty:ty, $val:ident) => {{
-            let ib = ImageBuilder::new(cfg.width, cfg.height)
-                .sample_type::<$ty>()
-                .samples_per_pixel(cfg.spp())
-                .photometric(PhotometricInterpretation::IccLab)
-                .extra_samples(vec![ExtraSample::UnassociatedAlpha; extras])
-                .compression(cfg.compression)
-                .planar_configuration(cfg.planar)
-                .strips(cfg.height);
+            let ib = apply_layout(
+                ImageBuilder::new(cfg.width, cfg.height)
+                    .sample_type::<$ty>()
+                    .samples_per_pixel(cfg.spp())
+                    .photometric(PhotometricInterpretation::IccLab)
+                    .extra_samples(vec![ExtraSample::UnassociatedAlpha; extras])
+                    .compression(cfg.compression)
+                    .planar_configuration(cfg.planar),
+                cfg.layout,
+            );
 
             let mut writer = writer_with(cfg.byte_order);
             let block_count = ib.checked_block_count().unwrap();
