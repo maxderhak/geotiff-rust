@@ -856,9 +856,11 @@ impl ImageBuilder {
     /// For `InkSet::NotCmyk` / `InkSet::Unknown(_)` the ink count is
     /// *implicit* — there is no `NumberOfInks` tag in this fork — so it is
     /// derived the same way the reader derives `color_channels`:
-    /// `samples_per_pixel - extra_samples.len()`, which must be at least 1.
-    /// Both `validate_color_model` and `effective_extra_samples` call this
-    /// so the two Separated arms stay consistent.
+    /// `samples_per_pixel - extra_samples.len()`. This may be **zero** when
+    /// every channel is an ExtraSample and there are no base ink channels (a
+    /// spot-only separation); such a Separated frame is valid. Both
+    /// `validate_color_model` and `effective_extra_samples` call this so the
+    /// two Separated arms stay consistent.
     fn separated_base_samples(&self) -> crate::error::Result<u16> {
         match self.ink_set.unwrap_or(InkSet::Cmyk) {
             InkSet::Cmyk => Ok(4),
@@ -876,9 +878,15 @@ impl ImageBuilder {
                         self.extra_samples.len()
                     ))
                 })?;
-                if base_samples == 0 {
+                // base_samples == 0 is valid on its own: a Separated image may
+                // declare every channel as an ExtraSample, leaving no base ink
+                // channels. Only a frame with NO channels at all (base + extras
+                // == 0) is rejected. The reader mirrors this (ifd.rs's Separated
+                // arm).
+                if base_samples == 0 && self.extra_samples.is_empty() {
                     return Err(crate::error::Error::InvalidConfig(
-                        "separated photometric interpretation must have at least one base ink channel"
+                        "separated photometric interpretation must have at least one channel \
+                         (a base ink or an extra sample)"
                             .into(),
                     ));
                 }

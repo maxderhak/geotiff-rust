@@ -145,6 +145,48 @@ fn separated_notcmyk_with_extra_samples_computes_base_from_remainder() {
     }
 }
 
+/// Spot-only separation: spp=16 with 16 declared ExtraSamples -> ZERO base
+/// ink channels (base = samples_per_pixel - extra_samples.len() = 0). Every
+/// channel is an ExtraSample and there are no base ink channels — a valid
+/// Separated frame. Both the writer and reader must accept
+/// `color_channels == 0` as long as there is at least one channel overall,
+/// and the 16 channels must round-trip byte-exact.
+#[test]
+fn separated_zero_base_all_extra_samples_roundtrips() {
+    let width: u32 = 2;
+    let samples_per_pixel: u16 = 16;
+    let values: Vec<u8> = (0..(width as u16 * samples_per_pixel))
+        .map(|i| i as u8)
+        .collect();
+
+    let (file, _decoded) = roundtrip_separated(
+        width,
+        samples_per_pixel,
+        InkSet::NotCmyk,
+        vec![ExtraSample::Unspecified; samples_per_pixel as usize],
+        &values,
+    );
+
+    let ifd = file.ifd(0).unwrap();
+    assert_eq!(ifd.ink_set().unwrap(), Some(InkSet::NotCmyk));
+    match ifd.color_model().unwrap() {
+        ColorModel::Separated {
+            ink_set,
+            color_channels,
+            extra_samples,
+        } => {
+            assert_eq!(ink_set, InkSet::NotCmyk);
+            assert_eq!(color_channels, 0, "a spot-only separation has zero base ink channels");
+            assert_eq!(
+                extra_samples.len(),
+                samples_per_pixel as usize,
+                "every channel is an ExtraSample"
+            );
+        }
+        other => panic!("expected ColorModel::Separated, got {other:?}"),
+    }
+}
+
 /// Regression: spp=4 with the default (Cmyk) InkSet must still resolve to
 /// the fixed 4-ink `ColorModel::Cmyk` path, unaffected by the new N-ink
 /// logic for `NotCmyk`/`Unknown`.

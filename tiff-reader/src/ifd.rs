@@ -910,9 +910,17 @@ fn validate_color_model(ifd: &Ifd, samples_per_pixel: usize, bits_per_sample: u1
             extra_samples,
             ..
         } => {
-            if *color_channels == 0 {
+            // color_channels == 0 is valid on its own: a Separated image whose
+            // channels are all ExtraSamples, with no base ink channels (a
+            // spot-only separation), is well formed. The pixel decoder's
+            // `0..color_channels` loop degenerates to zero base samples and
+            // `copy_extra_samples` handles all channels; the writer mirrors this
+            // (builder.rs's `separated_base_samples`). Only a frame with NO
+            // channels at all (color + extras == 0) is rejected.
+            if *color_channels == 0 && extra_samples.is_empty() {
                 return Err(Error::InvalidImageLayout(
-                    "separated photometric interpretation must have at least one base ink channel"
+                    "separated photometric interpretation must have at least one channel \
+                     (a base ink or an extra sample)"
                         .into(),
                 ));
             }
